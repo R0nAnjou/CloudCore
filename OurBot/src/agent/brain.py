@@ -6,14 +6,12 @@ import logging
 from typing import Any
 
 from . import defense, economy, protocol as P, tasks
-from .grid import next_step
+from .grid import next_step_adjacent, next_step_adjacent_to_any
 from .memory import Memory
 from .protocol import (
     Pos,
-    STATION,
     Unit,
     WALL,
-    WEAPON_BUILD_COST,
     buy_command,
     distance,
     move_command,
@@ -38,7 +36,7 @@ def decide(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
     _learn_from_feedback(turn)
 
     # 3) 召唤宝藏结果纠错
-    if turn.last_summon_result:
+    if turn.last_summon_result or MEMORY.treasure_pending_round:
         tasks.handle_summon_result(turn, MEMORY)
 
     # 4) 分派
@@ -48,7 +46,7 @@ def decide(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
     if turn.is_day:
         prompt, execute_cmd = _day_phase(turn, commands)
     else:
-        defense.night(turn, set(), commands)
+        prompt, execute_cmd = _night_phase(turn, commands)
 
     MEMORY.last_commands = {str(k): v for k, v in commands.items()}
     return {
@@ -56,6 +54,34 @@ def decide(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
         "prompt": prompt,
         "executeCmd": execute_cmd,
     }
+
+
+def _night_phase(
+    turn: P.Turn,
+    commands: dict[int, dict[str, Any]],
+) -> tuple[str, str]:
+    prompt = ""
+    execute_cmd = ""
+    claimed: set[Pos] = set()
+    protected: set[int] = set()
+    pioneers = turn.pioneers()
+    if pioneers:
+        pioneer = pioneers[0]
+        prompt, execute_cmd = tasks.pioneer(
+            turn, pioneer, MEMORY, claimed, commands, allow_new_task=False
+        )
+        if (
+            MEMORY.task_state != "idle"
+            or pioneer.unit_id in commands
+            or (
+                MEMORY.treasure_pos is not None
+                and MEMORY.treasure_items
+                and not MEMORY.treasure_done
+            )
+        ):
+            protected.add(pioneer.unit_id)
+    defense.night(turn, claimed, commands, protected)
+    return prompt, execute_cmd
 
 
 def _learn_from_feedback(turn: P.Turn) -> None:
@@ -127,13 +153,24 @@ def _dispatch_shopping(
         if holder is not None:
             _carry_to_use(turn, holder, name, claimed, commands)
             return
-        buyer = next((w for w in workers if not w.backpack_full), None)
+        reserved = _reserved_gold(turn, commands)
+        price = turn.shop_prices.get(name, 0) * num
+        if turn.gold - reserved < price:
+            return
+        buyer = next(
+            (
+                w for w in workers
+                if not w.backpack_full
+                and commands.get(w.unit_id, {}).get("action") not in {"build", "use", "buy"}
+            ),
+            None,
+        )
         if buyer is None:
             return
         if distance(buyer.pos, shop) <= 1:
             commands[buyer.unit_id] = buy_command(name, num)
         else:
-            step = next_step(turn, buyer, shop)
+            step = next_step_adjacent(turn, buyer, shop)
             if step is not None and step not in claimed:
                 claimed.add(step)
                 commands[buyer.unit_id] = move_command(step)
@@ -153,20 +190,56 @@ def _carry_to_use(
     footprint = station_footprint(station.pos)
     target = footprint[0]  # 基地左上格
     if name.startswith("Station"):
-        if distance(holder.pos, target) <= 1:
+        if min(distance(holder.pos, pos) for pos in footprint) <= 1:
             commands[holder.unit_id] = use_command(name, target)
         else:
-            step = next_step(turn, holder, target)
+            step = next_step_adjacent_to_any(turn, holder, list(footprint))
+            if step is not None and step not in claimed:
+                claimed.add(step)
+                commands[holder.unit_id] = move_command(step)
+    elif name.startswith("Weapon"):
+        wanted_level = 1 if name == P.WEAPON_UP_V1 else 2
+        weapon = next((w for w in turn.weapons() if w.level == wanted_level), None)
+        if weapon is None:
+            return
+        if distance(holder.pos, weapon.pos) <= 1:
+            commands[holder.unit_id] = use_command(name, weapon.pos)
+        else:
+            step = next_step_adjacent(turn, holder, weapon.pos)
+            if step is not None and step not in claimed:
+                claimed.add(step)
+                commands[holder.unit_id] = move_command(step)
+    elif name.startswith("WallUpgrade"):
+        wanted_level = 1 if name == P.WALL_UP_V1 else 2
+        wall = next((w for w in turn.walls() if w.level == wanted_level), None)
+        if wall is None:
+            return
+        if distance(holder.pos, wall.pos) <= 1:
+            commands[holder.unit_id] = use_command(name, wall.pos)
+        else:
+            step = next_step_adjacent(turn, holder, wall.pos)
             if step is not None and step not in claimed:
                 claimed.add(step)
                 commands[holder.unit_id] = move_command(step)
     elif name == P.WALL_FIXER:
         if economy.use_repair_if_needed(turn, holder, commands):
             return
-        for wall in turn.walls():
-            if wall.health < 1000 and distance(holder.pos, wall.pos) <= 1:
-                commands[holder.unit_id] = use_command(name, wall.pos)
-                return
+        wall = min(turn.walls(), key=lambda w: w.health, default=None)
+        if wall is not None:
+            step = next_step_adjacent(turn, holder, wall.pos)
+            if step is not None and step not in claimed:
+                claimed.add(step)
+                commands[holder.unit_id] = move_command(step)
+
+
+def _reserved_gold(turn: P.Turn, commands: dict[int, dict[str, Any]]) -> int:
+    total = 0
+    for cmd in commands.values():
+        if cmd.get("action") == "build" and cmd.get("name") in P.TOWER_TYPES:
+            total += P.WEAPON_BUILD_COST
+        elif cmd.get("action") == "buy":
+            total += turn.shop_prices.get(str(cmd.get("name") or ""), 0) * int(cmd.get("num") or 1)
+    return total
 
 
 # ---- 建造计划 ----------------------------------------------------------
@@ -182,12 +255,22 @@ def _build_plan(turn: P.Turn) -> economy.Plan:
         (
             pos
             for pos in _ring(footprint, radius=1)
-            if turn.land(pos) and MEMORY.build_allowed(pos, P.GATLING)
+            if turn.land(pos)
         ),
         key=lambda p: (distance(p, center), p.x, p.y),
     )
-    tower_sites = tuple(sites[:3])
-    tower_kinds = economy.TOWER_LOADOUT[: len(tower_sites)]
+    chosen_sites: list[Pos] = []
+    chosen_kinds: list[str] = []
+    for kind in economy.TOWER_LOADOUT:
+        site = next(
+            (p for p in sites if p not in chosen_sites and MEMORY.build_allowed(p, kind)),
+            None,
+        )
+        if site is not None:
+            chosen_sites.append(site)
+            chosen_kinds.append(kind)
+    tower_sites = tuple(chosen_sites)
+    tower_kinds = tuple(chosen_kinds)
 
     # 围墙圈: 半径 2, 预留朝地图中央的入口
     entrance_dir = _dominant_axis(footprint[0], center)

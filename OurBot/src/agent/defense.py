@@ -9,7 +9,7 @@
 from typing import Any
 
 from . import protocol as P
-from .grid import line_cells, neighbours
+from .grid import line_cells, neighbours, next_step_adjacent, next_step_adjacent_to_any
 from .protocol import (
     BOSS_ROBOT,
     GATLING,
@@ -26,45 +26,49 @@ from .protocol import (
     move_command,
 )
 
-ROBOT_THREAT_VALUE = {SMALL_ROBOT: 10, MIDDLE_ROBOT: 9, LARGE_ROBOT: 8, BOSS_ROBOT: 7}
+ROBOT_THREAT_VALUE = {SMALL_ROBOT: 5, MIDDLE_ROBOT: 12, LARGE_ROBOT: 30, BOSS_ROBOT: 60}
 
 
 def night(
     turn: P.Turn,
     claimed: set[Pos],
     commands: dict[int, dict[str, Any]],
+    unavailable_role_ids: set[int] | None = None,
 ) -> None:
     """夜晚主流程: 为每座武器配一名炮手, 选目标开火; 无武器时角色撤回基地。"""
-    pairs = _pair_gunners(turn)
-    remaining = list(turn.robots)
+    unavailable_role_ids = unavailable_role_ids or set()
+    pairs = _pair_gunners(turn, unavailable_role_ids)
+    remaining_hp = {robot.robot_id: robot.health for robot in turn.robots}
 
     # 按武器类型顺序开火: 火箭(群伤) -> 电磁(穿透) -> 加特林(补刀)
     for tower, gunner in sorted(pairs, key=lambda p: (p[0].cooldown > 0, p[0].kind != ROCKET, p[0].kind != RAILGUN)):
         if distance(gunner.pos, tower.pos) > 1:
             # 炮手不在位: 先归位(每回合一步)
-            from .grid import next_step
-
-            step = next_step(turn, gunner, tower.pos)
+            step = next_step_adjacent(turn, gunner, tower.pos)
             if step is not None and step not in claimed:
                 claimed.add(step)
                 commands[gunner.unit_id] = move_command(step)
             continue
         if tower.cooldown > 0:
             continue
-        targets = _choose_targets(turn, tower, remaining)
+        targets = _choose_targets(turn, tower, list(turn.robots), remaining_hp)
         if not targets:
             continue
         commands[tower.unit_id] = attack_command(gunner.unit_id, targets)
-        _deduct_expected(turn, tower, targets, remaining)
+        _deduct_expected(tower, targets, list(turn.robots), remaining_hp)
         claimed.add(gunner.pos)
 
     # 没有配到武器的角色: 撤回基地附近避险
     _evacuate_idle_roles(turn, pairs, claimed, commands)
 
 
-def _pair_gunners(turn: P.Turn) -> list[tuple[Unit, Unit]]:
+def _pair_gunners(
+    turn: P.Turn,
+    unavailable_role_ids: set[int] | None = None,
+) -> list[tuple[Unit, Unit]]:
     """角色-武器配对: 就近贪心(角色数 <= 武器数)。"""
-    roles = list(turn.controllable())
+    unavailable_role_ids = unavailable_role_ids or set()
+    roles = [r for r in turn.controllable() if r.unit_id not in unavailable_role_ids]
     towers = list(turn.weapons())
     pairs: list[tuple[Unit, Unit]] = []
     used_roles: set[int] = set()
@@ -82,34 +86,59 @@ def _pair_gunners(turn: P.Turn) -> list[tuple[Unit, Unit]]:
     return pairs
 
 
-def _choose_targets(turn: P.Turn, tower: Unit, robots: list[Robot]) -> list[P.Pos]:
+def _choose_targets(
+    turn: P.Turn,
+    tower: Unit,
+    robots: list[Robot],
+    remaining_hp: dict[int, int] | None = None,
+) -> list[P.Pos]:
+    remaining_hp = remaining_hp or {robot.robot_id: robot.health for robot in robots}
     reach = tower.range_of_attack()
-    in_range = [r for r in robots if r.health > 0 and not r.dizzy and distance(tower.pos, r.pos) <= reach]
+    in_range = [
+        r for r in robots
+        if remaining_hp.get(r.robot_id, 0) > 0 and distance(tower.pos, r.pos) <= reach
+    ]
     if not in_range:
         return []
 
     if tower.kind == ROCKET:
-        # 群伤: 选"落点期望伤害/剩余血量溢出"最优的中心
-        best_pos, best_value = None, -1
-        for center in in_range:
-            cluster = [r for r in in_range if distance(center.pos, r.pos) <= 1]
-            expected = sum(min(20 if r.pos == center.pos else 10, r.health) for r in cluster)
-            value = expected
-            if value > best_value:
-                best_pos, best_value = center.pos, value
-        return [best_pos] if best_pos else []
+        # 导弹允许落点重叠；逐枚选择边际收益最大的格，确保数量始终等于等级。
+        candidates = {
+            pos
+            for robot in in_range
+            for pos in (robot.pos, *neighbours(robot.pos))
+            if 0 <= pos.x < turn.width
+            and 0 <= pos.y < turn.height
+            and distance(tower.pos, pos) <= reach
+        }
+        simulated = dict(remaining_hp)
+        chosen: list[Pos] = []
+        for _ in range(max(1, tower.level)):
+            best = max(
+                candidates,
+                key=lambda center: _rocket_value(turn, center, in_range, simulated),
+            )
+            chosen.append(best)
+            _apply_rocket(best, in_range, simulated)
+        return chosen
 
     if tower.kind == RAILGUN:
         # 穿透: 选弹道上"累计可打伤害"最大的目标
         best_pos, best_value = None, -1
         for robot in in_range:
             path = line_cells(tower.pos, robot.pos)
-            blockers = [r for r in robots if r.pos in path and distance(tower.pos, r.pos) <= reach]
+            blockers = [
+                r for r in robots
+                if remaining_hp.get(r.robot_id, 0) > 0
+                and r.pos in path
+                and distance(tower.pos, r.pos) <= reach
+            ]
             energy = 10 * tower.level
             value = 0
             for r in sorted(blockers, key=lambda r: distance(tower.pos, r.pos)):
-                value += min(energy, r.health)
-                energy -= min(energy, r.health)
+                hp = remaining_hp[r.robot_id]
+                value += min(energy, hp)
+                energy -= min(energy, hp)
                 if energy <= 0:
                     break
             if value > best_value:
@@ -118,27 +147,70 @@ def _choose_targets(turn: P.Turn, tower: Unit, robots: list[Robot]) -> list[P.Po
 
     # 加特林: 目标数 = 等级, 须在同一 90° 锥形内
     max_targets = tower.level
-    ordered = sorted(
-        in_range,
-        key=lambda r: (-ROBOT_THREAT_VALUE.get(r.kind, 5), r.health, distance(tower.pos, r.pos)),
-    )
-    chosen: list[P.Pos] = []
+    ordered = sorted(in_range, key=lambda r: _robot_priority(turn, tower, r, remaining_hp))
+    best_group: list[Robot] = []
+    best_score = -1
     for seed in ordered:
-        if any(seed.pos == c for c in chosen):
-            continue
         group = [seed]
         for other in ordered:
-            if other is seed or any(other.pos == c for c in chosen):
+            if other.robot_id == seed.robot_id or len(group) >= max_targets:
                 continue
-            if len(group) >= max_targets:
-                break
-            if _within_90deg(tower.pos, seed.pos, other.pos):
+            if all(_within_90deg(tower.pos, member.pos, other.pos) for member in group):
                 group.append(other)
-        if group:
-            chosen.extend(r.pos for r in group)
-        if len(chosen) >= max_targets:
-            break
-    return chosen[:max_targets]
+        score = sum(_robot_value(turn, r, remaining_hp) for r in group)
+        if score > best_score:
+            best_group, best_score = group, score
+    chosen = [robot.pos for robot in best_group[:max_targets]]
+    # 规则要求目标数与等级一致。重复同一路径表示多颗子弹沿同方向射击。
+    while chosen and len(chosen) < max_targets:
+        chosen.append(chosen[0])
+    return chosen
+
+
+def _robot_value(turn: P.Turn, robot: Robot, remaining_hp: dict[int, int]) -> int:
+    targets_us = not robot.target_team or robot.target_team == turn.team_type
+    protection_bonus = 100 if targets_us else 0
+    return protection_bonus + ROBOT_THREAT_VALUE.get(robot.kind, 5) + robot.score * 4 - min(
+        remaining_hp.get(robot.robot_id, robot.health), 100
+    ) // 20
+
+
+def _robot_priority(
+    turn: P.Turn,
+    tower: Unit,
+    robot: Robot,
+    remaining_hp: dict[int, int],
+) -> tuple[int, int, int]:
+    return (
+        -_robot_value(turn, robot, remaining_hp),
+        remaining_hp.get(robot.robot_id, robot.health),
+        distance(tower.pos, robot.pos),
+    )
+
+
+def _rocket_value(
+    turn: P.Turn,
+    center: Pos,
+    robots: list[Robot],
+    remaining_hp: dict[int, int],
+) -> int:
+    value = 0
+    for robot in robots:
+        hp = remaining_hp.get(robot.robot_id, 0)
+        if hp <= 0 or distance(center, robot.pos) > 1:
+            continue
+        damage = 20 if robot.pos == center else 10
+        multiplier = 3 if not robot.target_team or robot.target_team == turn.team_type else 1
+        value += min(damage, hp) * multiplier + robot.score
+    return value
+
+
+def _apply_rocket(center: Pos, robots: list[Robot], remaining_hp: dict[int, int]) -> None:
+    for robot in robots:
+        hp = remaining_hp.get(robot.robot_id, 0)
+        if hp <= 0 or distance(center, robot.pos) > 1:
+            continue
+        remaining_hp[robot.robot_id] = hp - (20 if robot.pos == center else 10)
 
 
 def _within_90deg(origin: P.Pos, a: P.Pos, b: P.Pos) -> bool:
@@ -150,35 +222,33 @@ def _within_90deg(origin: P.Pos, a: P.Pos, b: P.Pos) -> bool:
 
 
 def _deduct_expected(
-    turn: P.Turn,
     tower: Unit,
     targets: list[P.Pos],
-    remaining: list[Robot],
+    robots: list[Robot],
+    remaining_hp: dict[int, int],
 ) -> None:
     """预扣本回合伤害, 让后续武器的目标选择知道'这只怪会被打掉多少血'。"""
     if tower.kind == ROCKET:
         for center in targets:
-            for r in remaining:
-                if r.pos == center:
-                    r.health -= 20
-                elif distance(center, r.pos) <= 1:
-                    r.health -= 10
+            _apply_rocket(center, robots, remaining_hp)
     elif tower.kind == RAILGUN:
         energy = 10 * tower.level
         path = line_cells(tower.pos, targets[0]) if targets else []
-        for r in sorted(remaining, key=lambda r: distance(tower.pos, r.pos)):
-            if r.pos in path:
-                dmg = min(energy, r.health)
-                r.health -= dmg
+        for r in sorted(robots, key=lambda r: distance(tower.pos, r.pos)):
+            hp = remaining_hp.get(r.robot_id, 0)
+            if hp > 0 and r.pos in path:
+                dmg = min(energy, hp)
+                remaining_hp[r.robot_id] = hp - dmg
                 energy -= dmg
                 if energy <= 0:
                     break
     else:  # gatling
         for pos in targets:
             path = line_cells(tower.pos, pos)
-            for r in sorted(remaining, key=lambda r: distance(tower.pos, r.pos)):
-                if r.pos in path:
-                    r.health -= 10
+            for r in sorted(robots, key=lambda r: distance(tower.pos, r.pos)):
+                hp = remaining_hp.get(r.robot_id, 0)
+                if hp > 0 and r.pos in path:
+                    remaining_hp[r.robot_id] = hp - 10
                     break
 
 
@@ -188,7 +258,6 @@ def _evacuate_idle_roles(
     claimed: set[Pos],
     commands: dict[int, dict[str, Any]],
 ) -> None:
-    from .grid import next_step
     from .protocol import station_footprint
 
     assigned = {g.unit_id for _, g in pairs}
@@ -202,7 +271,7 @@ def _evacuate_idle_roles(
             continue
         if distance(role.pos, shelter) <= 1:
             continue
-        step = next_step(turn, role, shelter)
+        step = next_step_adjacent_to_any(turn, role, list(footprint))
         if step is not None and step not in claimed:
             claimed.add(step)
             commands[role.unit_id] = move_command(step)

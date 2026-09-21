@@ -47,18 +47,26 @@ class Memory:
     # 5) 宝藏解谜状态
     treasure_items: list[str] | None = None
     treasure_pos: Pos | None = None
-    treasure_tried_pos: set[tuple[int, int]] = field(default_factory=set)
+    treasure_open_hint: str = ""
+    treasure_done: bool = False
+    treasure_pending_round: int = 0
+    treasure_last_prompt_day: int = 0
+    treasure_last_prompt_legend_count: int = 0
     # 6) LLM 流水线状态
     pending_prompt_round: int = 0  # 发出 prompt 的回合号, 0=无
+    pending_prompt_kind: str = ""  # task / treasure
     llm_calls_this_day: int = 0
     llm_day: int = 0
     # 7) 自进化任务状态机
-    task_state: str = "idle"  # idle / accepted / exploring / answered / done
+    task_state: str = "idle"  # idle / accepting / accepted / exploring / answering
     task_started_round: int = 0
     task_point: Pos | None = None
     task_desc: str = ""
     task_steps_tried: int = 0
     task_answer: str = ""
+    task_answered_round: int = 0
+    task_transcript: list[str] = field(default_factory=list)
+    task_last_result_round: int = 0
     # 8) SOP 知识库
     sops: list[SopRecord] = field(default_factory=list)
     # 9) 上回合发出的指令缓存(兜底重发用)
@@ -109,21 +117,46 @@ class Memory:
             self.llm_calls_this_day = 0
         self.llm_calls_this_day += 1
         self.pending_prompt_round = 0
+        self.pending_prompt_kind = ""
+
+    def reset_task(self) -> None:
+        self.task_state = "idle"
+        self.task_started_round = 0
+        self.task_point = None
+        self.task_desc = ""
+        self.task_steps_tried = 0
+        self.task_answer = ""
+        self.task_answered_round = 0
+        self.task_transcript.clear()
+        self.task_last_result_round = 0
+        if self.pending_prompt_kind == "task":
+            self.pending_prompt_round = 0
+            self.pending_prompt_kind = ""
 
     # ------------------------------------------------------------------
     def find_sop(self, task_desc: str) -> SopRecord | None:
         """按任务描述的粗特征指纹查 SOP(首版: 关键词重合度)。"""
         best: SopRecord | None = None
         best_score = 0
-        words = set(re.findall(r"[\w\u4e00-\u9fff]+", task_desc))
+        words = _task_tokens(task_desc)
         for sop in self.sops:
-            key_words = set(re.findall(r"[\w\u4e00-\u9fff]+", sop.fingerprint))
-            score = len(words & key_words)
+            key_words = _task_tokens(sop.fingerprint)
+            union = words | key_words
+            score = len(words & key_words) / len(union) if union else 0
             if score > best_score:
                 best, best_score = sop, score
-        return best if best_score >= 2 else None
+        return best if best_score >= 0.55 else None
 
     def add_sop(self, fingerprint: str, steps: list[str], answer_hint: str = "") -> None:
         record = SopRecord(fingerprint=fingerprint, steps=list(steps), answer_hint=answer_hint)
         self.sops.append(record)
         LOGGER.info("SOP saved: %s (%d steps)", fingerprint[:40], len(steps))
+
+
+def _task_tokens(text: str) -> set[str]:
+    """英文按词、中文按双字组生成稳定指纹，避免整句中文只成为一个 token。"""
+    lowered = text.lower()
+    tokens = set(re.findall(r"[a-z0-9_]+", lowered))
+    chinese = "".join(re.findall(r"[\u4e00-\u9fff]", lowered))
+    tokens.update(chinese[i:i + 2] for i in range(max(0, len(chinese) - 1)))
+    return tokens

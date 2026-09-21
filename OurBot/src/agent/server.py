@@ -1,4 +1,4 @@
-"""HTTP 服务: 5 秒 deadline 守卫 + 全局异常兜底(重发上回合指令)。
+"""HTTP 服务: 5 秒 deadline 守卫 + 全局异常兜底。
 
 判题器约定:
 - 建立连接 >10s 或响应 >5s 记一次异常; 累计 5 次淘汰。
@@ -32,8 +32,6 @@ class Handler(BaseHTTPRequestHandler):
             self._send({"roleCommandMap": {}, "prompt": "", "executeCmd": ""})
             return
 
-        from .brain import MEMORY  # 延迟导入避免循环
-
         result_holder: dict[str, Any] = {}
         done = threading.Event()
 
@@ -43,7 +41,8 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 LOGGER.exception("decide failed, fallback")
                 result_holder["value"] = {
-                    "roleCommandMap": dict(MEMORY.last_commands),
+                    # 旧指令可能已过期或跨越昼夜；空指令是唯一可靠兜底。
+                    "roleCommandMap": {},
                     "prompt": "",
                     "executeCmd": "",
                 }
@@ -55,7 +54,7 @@ class Handler(BaseHTTPRequestHandler):
         if not done.wait(timeout=DEADLINE_SECONDS):
             LOGGER.error("decision timeout (round %s), fallback", payload.get("roundNo"))
             result_holder["value"] = {
-                "roleCommandMap": dict(MEMORY.last_commands),
+                "roleCommandMap": {},
                 "prompt": "",
                 "executeCmd": "",
             }

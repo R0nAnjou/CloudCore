@@ -24,6 +24,8 @@ VALID_ACTIONS = {
 
 def main() -> None:
     sample = json.loads((ROOT.parent / "docs" / "request.txt").read_text(encoding="utf-8"))
+    # 冒烟循环不模拟 LLM 回包；关闭传闻，避免制造并不存在的异步超时噪声。
+    sample.setdefault("worldNews", {})["folkLegends"] = ""
     ok_rounds = 0
     total_cmds = 0
     problems: list[str] = []

@@ -211,11 +211,22 @@ class ShopItem:
 
 
 @dataclass(frozen=True, slots=True)
+class GameError:
+    code: int
+    description: str
+
+    @classmethod
+    def load(cls, raw: dict[str, Any]) -> "GameError":
+        return cls(int(raw.get("errorCode") or 0), str(raw.get("description") or ""))
+
+
+@dataclass(frozen=True, slots=True)
 class Turn:
     """单回合状态快照(仅包含决策所需字段)。"""
 
     round_no: int
     is_day: bool
+    team_type: str
     gold: int
     width: int
     height: int
@@ -233,6 +244,7 @@ class Turn:
     last_summon_result: int
     vendor_prices: dict[str, int]
     shop_prices: dict[str, int]
+    errors: tuple[GameError, ...]
 
     @classmethod
     def load(cls, payload: dict[str, Any]) -> "Turn":
@@ -241,40 +253,45 @@ class Turn:
         team = payload["teamOur"]
         world = payload.get("worldNews") or {}
         return cls(
-            round_no,
-            is_day_round(round_no),
-            int(team.get("goldNum") or 0),
-            int(info["width"]),
-            int(info["height"]),
-            {
+            round_no=round_no,
+            is_day=is_day_round(round_no),
+            team_type=str(team.get("type") or ""),
+            gold=int(team.get("goldNum") or 0),
+            width=int(info["width"]),
+            height=int(info["height"]),
+            zones={
                 Pos.load(zone["pos"]): str(zone["neutralType"])
                 for zone in info.get("zones") or ()
             },
-            tuple(Unit.load(role) for role in team.get("roles") or ()),
-            tuple(Unit.load(role) for role in (payload.get("teamEnemy") or {}).get("roles") or ()),
-            tuple(
+            ours=tuple(Unit.load(role) for role in team.get("roles") or ()),
+            enemy_roles=tuple(
+                Unit.load(role)
+                for role in (payload.get("teamEnemy") or {}).get("roles") or ()
+            ),
+            robots=tuple(
                 Robot.load(robot)
                 for robot in (payload.get("robot") or {}).get("roles") or ()
             ),
-            tuple(PlayerTask.load(t) for t in team.get("playerTasks") or ()),
-            str(payload.get("phaseTask") or ""),
-            str(payload.get("llmResp") or ""),
-            str(payload.get("lastCmdResult") or ""),
-            str(world.get("officialNews") or ""),
-            str(world.get("folkLegends") or ""),
-            {
+            player_tasks=tuple(PlayerTask.load(t) for t in team.get("playerTasks") or ()),
+            phase_task=str(payload.get("phaseTask") or ""),
+            llm_resp=str(payload.get("llmResp") or ""),
+            last_cmd_result=str(payload.get("lastCmdResult") or ""),
+            world_official_news=str(world.get("officialNews") or ""),
+            world_folk_legends=str(world.get("folkLegends") or ""),
+            last_action_results={
                 int(k): bool(v)
                 for k, v in (payload.get("lastRoundRoleActionResults") or {}).items()
             },
-            int(payload.get("lastSummonTreasureResult") or 0),
-            {
+            last_summon_result=int(payload.get("lastSummonTreasureResult") or 0),
+            vendor_prices={
                 str(v.get("name")): int(v.get("price") or 0)
                 for v in payload.get("vendorShopList") or ()
             },
-            {
+            shop_prices={
                 str(v.get("name")): int(v.get("price") or 0)
                 for v in payload.get("weaponShopList") or ()
             },
+            errors=tuple(GameError.load(v) for v in payload.get("errors") or ()),
         )
 
     # ---- 单位查询 ------------------------------------------------------
@@ -353,15 +370,20 @@ class Turn:
     def occupied_cells(self) -> set[Pos]:
         cells: set[Pos] = set()
         for unit in self.ours:
-            cells.update(self.foot_print(unit))
+            if unit.health > 0:
+                cells.update(self.foot_print(unit))
         return cells
 
     def blocked(self, moving: Unit) -> set[Pos]:
         cells = {pos for pos, kind in self.zones.items() if kind != LAND}
         cells.update(self.occupied_cells())
         cells.discard(moving.pos)
+        for unit in self.enemy_roles:
+            if unit.health > 0:
+                cells.update(self.foot_print(unit))
         for robot in self.robots:
-            cells.add(robot.pos)
+            if robot.health > 0:
+                cells.add(robot.pos)
         return cells
 
 
