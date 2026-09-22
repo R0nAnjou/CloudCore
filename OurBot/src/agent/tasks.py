@@ -84,12 +84,25 @@ def _sync_task_state(turn: P.Turn, role: Unit, memory: Memory) -> None:
         memory.reset_task()
         return
     if 2 in error_codes and memory.task_state == "answering":
-        memory.task_state = "exploring"
-        memory.task_answer = ""
-        memory.task_answered_round = 0
-        memory.pending_prompt_round = 0
-        memory.pending_prompt_kind = ""
-        memory.task_transcript.append("上次提交的答案不正确或不完整。")
+        reason = "; ".join(error.description for error in turn.errors if error.code == 2)
+        _reject_task_answer(memory, reason or "答案错误或不完整")
+    elif memory.task_state == "answering" and turn.last_action_results.get(role.unit_id) is False:
+        _reject_task_answer(memory, "提交动作被判非法")
+
+    if (
+        memory.task_state == "answering"
+        and not turn.phase_task
+        and turn.round_no > memory.task_answered_round
+        and not ({1, 2, 4} & error_codes)
+        and role.health > 0
+        and memory.task_point is not None
+        and distance(role.pos, memory.task_point) <= 1
+    ):
+        # 只有提交后任务实际结束、且没有失败反馈，才将答案视为可复用经验。
+        memory.add_sop(memory.task_desc, _extract_steps(memory), memory.task_answer[:2000])
+        LOGGER.info("task completed after answer submission")
+        memory.reset_task()
+        return
 
     if memory.task_state == "accepting":
         if turn.phase_task:
@@ -115,9 +128,23 @@ def _sync_task_state(turn: P.Turn, role: Unit, memory: Memory) -> None:
         and turn.round_no - memory.task_answered_round > 1
         and 2 not in error_codes
     ):
-        memory.task_state = "exploring"
-        memory.task_answer = ""
-        memory.task_transcript.append("任务在提交后仍未结束，请复核所有必填字段。")
+        _reject_task_answer(memory, "提交后任务仍未结束，需复核答案")
+
+
+def _reject_task_answer(memory: Memory, reason: str) -> None:
+    answer = memory.task_answer.strip()
+    if answer and answer not in memory.task_rejected_answers:
+        memory.task_rejected_answers.append(answer)
+    memory.task_transcript.append(
+        f"上次提交未通过：{reason[:300]}。已尝试答案：{answer[:300]!r}。"
+        "请继续核对沙盒文件，不要重复提交相同答案。"
+    )
+    LOGGER.warning("task answer rejected: %s; answer=%r", reason[:160], answer[:80])
+    memory.task_state = "exploring"
+    memory.task_answer = ""
+    memory.task_answered_round = 0
+    memory.pending_prompt_round = 0
+    memory.pending_prompt_kind = ""
 
 
 def _pick_task_point(turn: P.Turn) -> Pos | None:
@@ -160,10 +187,8 @@ def _task_pipeline(
         sop = memory.find_sop(desc)
         if sop is not None and sop.fingerprint == desc and sop.answer_hint:
             memory.task_answer = sop.answer_hint
-        elif sop is not None:
-            return _request_task_llm(turn, memory, desc, sop), ""
-        else:
-            memory.task_state = "exploring"
+        # 相似任务的答案不能直接用于当前任务；先读取当前沙盒材料。
+        memory.task_state = "exploring"
 
     if memory.task_state == "answering":
         return "", ""
@@ -172,7 +197,7 @@ def _task_pipeline(
         commands[role.unit_id] = submit_answer_command(memory.task_answer)
         memory.task_state = "answering"
         memory.task_answered_round = turn.round_no
-        memory.add_sop(desc, _extract_steps(memory), memory.task_answer[:2000])
+        LOGGER.info("task answer submitted (%d chars), awaiting result", len(memory.task_answer))
         return "", ""
 
     if memory.pending_prompt_kind == "task":
@@ -183,7 +208,7 @@ def _task_pipeline(
         memory.task_steps_tried += 1
         return "", next_cmd
 
-    return _request_task_llm(turn, memory, desc, None), ""
+    return _request_task_llm(turn, memory, desc, memory.find_sop(desc)), ""
 
 
 def _next_explore_command(memory: Memory, desc: str) -> str | None:
@@ -193,18 +218,41 @@ def _next_explore_command(memory: Memory, desc: str) -> str | None:
     if step == 0:
         return "pwd; find . -maxdepth 4 -type f -print | head -100"
     if step == 1 and local_target:
-        return f"sed -n '1,240p' '{local_target}' 2>/dev/null"
+        filename = local_target.rsplit("/", 1)[-1]
+        return (
+            f"find . -maxdepth 5 -type f -name '{filename}' "
+            "-print -exec sed -n '1,240p' {} \\; 2>/dev/null | head -300"
+        )
     if step <= 1:
         return (
             "find . -maxdepth 4 -type f "
             "\\( -iname '*.md' -o -iname '*.txt' -o -iname '*.json' \\) "
             "-print -exec sed -n '1,160p' {} \\; 2>/dev/null | head -1200"
         )
+    if not memory.task_rejected_answers:
+        return None
+    if step == 2 and local_target:
+        filename = local_target.rsplit("/", 1)[-1]
+        return (
+            f"find . -maxdepth 5 -type f -name '{filename}' "
+            "-print -exec sed -n '241,800p' {} \\; 2>/dev/null | head -600"
+        )
+    if step <= 3:
+        return (
+            "find . -maxdepth 5 -type f "
+            "\\( -iname '*.md' -o -iname '*.txt' -o -iname '*.json' "
+            "-o -iname '*.yaml' -o -iname '*.yml' \\) "
+            "-print -exec sed -n '1,240p' {} \\; 2>/dev/null | head -1200"
+        )
     return None
 
 
 def _extract_local_target(desc: str) -> str:
-    match = re.search(r"(?:^|\s)([\w./-]+\.(?:md|txt|json|yaml|yml))(?:\s|$)", desc)
+    match = re.search(
+        r"(?<![A-Za-z0-9_./-])([A-Za-z0-9_./-]+\.(?:md|txt|json|yaml|yml))"
+        r"(?=$|[^A-Za-z0-9_./-])",
+        desc,
+    )
     return match.group(1) if match else ""
 
 
@@ -225,6 +273,9 @@ def _request_task_llm(
             "\n--- 相似任务经验（只作参考，必须按当前参数改写） ---\n"
             f"任务: {sop.fingerprint}\n答案: {sop.answer_hint}\n"
         )
+    rejected = "\n".join(memory.task_rejected_answers[-3:])
+    if rejected:
+        prior += f"\n--- 已被判错误或未完成的答案（禁止原样重复） ---\n{rejected}\n"
     return (
         "你是游戏内任务求解器。请根据当前任务、沙盒输出和相似任务经验，直接输出可提交的完整答案。"
         "不要解释，不要添加 Markdown 围栏；必须覆盖任务要求的所有字段。\n"
@@ -243,8 +294,12 @@ def _consume_llm_resp(turn: P.Turn, memory: Memory, resp: str) -> None:
         return
     kind = memory.pending_prompt_kind
     if kind == "task" and memory.task_state in ACTIVE_TASK_STATES:
-        memory.task_answer = resp.strip()
-        LOGGER.info("LLM produced task answer (%d chars)", len(resp))
+        answer = resp.strip()
+        if answer and answer not in memory.task_rejected_answers:
+            memory.task_answer = answer
+            LOGGER.info("LLM produced task answer (%d chars)", len(answer))
+        else:
+            LOGGER.warning("LLM returned empty or previously rejected task answer")
         memory.pending_prompt_round = 0
         memory.pending_prompt_kind = ""
     elif kind == "treasure":

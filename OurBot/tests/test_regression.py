@@ -12,7 +12,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from agent import defense, tasks  # noqa: E402
 from agent.grid import next_step_adjacent  # noqa: E402
 from agent.memory import Memory  # noqa: E402
-from agent.protocol import Pos, Robot, Turn  # noqa: E402
+from agent.protocol import GameError, Pos, Robot, Turn  # noqa: E402
 
 
 class RegressionTests(unittest.TestCase):
@@ -108,6 +108,95 @@ class RegressionTests(unittest.TestCase):
         tasks.pioneer(turn, role, memory, set(), commands)
         self.assertEqual("submitAnswer", commands[role.unit_id]["action"])
         self.assertEqual("晴，25°C", commands[role.unit_id]["taskAnswer"])
+        self.assertEqual([], memory.sops)
+
+    def test_task_filename_with_chinese_punctuation_is_read(self) -> None:
+        desc = "请阅读task_1_alpha.md，获取任务信息"
+        self.assertEqual("task_1_alpha.md", tasks._extract_local_target(desc))
+        memory = Memory(task_steps_tried=1)
+        self.assertIn("-name 'task_1_alpha.md'", tasks._next_explore_command(memory, desc))
+
+    def test_rejected_answer_triggers_more_exploration_not_sop(self) -> None:
+        desc = "请阅读task_1_alpha.md，获取任务信息"
+        role = replace(self.turn.pioneers()[0], pos=Pos(13, 14))
+        turn = replace(
+            self.turn, round_no=6, phase_task=desc,
+            errors=(GameError(2, "答案缺少字段"),),
+        )
+        memory = Memory(
+            task_state="answering", task_started_round=2, task_point=Pos(14, 14),
+            task_desc=desc, task_steps_tried=2, task_answer="错误答案",
+            task_answered_round=5,
+        )
+        commands = {}
+        prompt, execute = tasks.pioneer(turn, role, memory, set(), commands)
+        self.assertEqual("", prompt)
+        self.assertIn("241,800p", execute)
+        self.assertEqual([], memory.sops)
+        self.assertEqual(["错误答案"], memory.task_rejected_answers)
+        self.assertNotIn(role.unit_id, commands)
+        self.assertIn("答案缺少字段", memory.task_transcript[-1])
+
+    def test_verified_answer_is_saved_only_after_task_ends(self) -> None:
+        desc = "请阅读task_1_alpha.md，获取任务信息"
+        role = replace(self.turn.pioneers()[0], pos=Pos(13, 14))
+        memory = Memory(
+            task_state="answering", task_started_round=2, task_point=Pos(14, 14),
+            task_desc=desc, task_answer="正确答案", task_answered_round=5,
+        )
+        pending = replace(self.turn, round_no=5, phase_task=desc, errors=())
+        tasks._sync_task_state(pending, role, memory)
+        self.assertEqual([], memory.sops)
+        completed = replace(pending, round_no=6, phase_task="")
+        tasks._sync_task_state(completed, role, memory)
+        self.assertEqual("idle", memory.task_state)
+        self.assertEqual("正确答案", memory.sops[0].answer_hint)
+
+    def test_task_timeout_never_saves_unverified_answer(self) -> None:
+        role = replace(self.turn.pioneers()[0], pos=Pos(13, 14))
+        memory = Memory(
+            task_state="answering", task_started_round=2, task_point=Pos(14, 14),
+            task_desc="任务", task_answer="待验证答案", task_answered_round=5,
+        )
+        timed_out = replace(
+            self.turn, round_no=6, phase_task="", errors=(GameError(1, "任务超时"),),
+        )
+        tasks._sync_task_state(timed_out, role, memory)
+        self.assertEqual("idle", memory.task_state)
+        self.assertEqual([], memory.sops)
+
+    def test_repeated_llm_answer_is_not_resubmitted(self) -> None:
+        desc = "请阅读task_1_alpha.md，获取任务信息"
+        role = replace(self.turn.pioneers()[0], pos=Pos(13, 14))
+        memory = Memory(
+            task_state="exploring", task_started_round=2, task_point=Pos(14, 14),
+            task_desc=desc, task_steps_tried=4,
+            task_rejected_answers=["错误答案"],
+            pending_prompt_round=5, pending_prompt_kind="task",
+        )
+        turn = replace(
+            self.turn, round_no=6, phase_task=desc, llm_resp="错误答案", errors=(),
+        )
+        commands = {}
+        prompt, execute = tasks.pioneer(turn, role, memory, set(), commands)
+        self.assertNotIn(role.unit_id, commands)
+        self.assertEqual("", execute)
+        self.assertIn("错误答案", prompt)
+
+    def test_similar_sop_still_reads_current_task_material(self) -> None:
+        desc = "请阅读task_2_beta.md，获取任务信息"
+        role = replace(self.turn.pioneers()[0], pos=Pos(13, 14))
+        memory = Memory(
+            task_state="accepted", task_started_round=2, task_point=Pos(14, 14),
+            task_desc=desc,
+        )
+        memory.add_sop("请阅读task_1_alpha.md，获取任务信息", [], "上次答案")
+        turn = replace(self.turn, round_no=3, phase_task=desc, errors=())
+        commands = {}
+        prompt, execute = tasks.pioneer(turn, role, memory, set(), commands)
+        self.assertEqual("", prompt)
+        self.assertTrue(execute)
+        self.assertNotIn(role.unit_id, commands)
 
     def test_task_supplies_are_derived_from_shop(self) -> None:
         supplies = tasks.task_supply_names(self.turn)

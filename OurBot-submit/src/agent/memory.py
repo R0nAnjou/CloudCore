@@ -65,6 +65,7 @@ class Memory:
     task_steps_tried: int = 0
     task_answer: str = ""
     task_answered_round: int = 0
+    task_rejected_answers: list[str] = field(default_factory=list)
     task_transcript: list[str] = field(default_factory=list)
     task_last_result_round: int = 0
     # 8) SOP 知识库
@@ -127,6 +128,7 @@ class Memory:
         self.task_steps_tried = 0
         self.task_answer = ""
         self.task_answered_round = 0
+        self.task_rejected_answers.clear()
         self.task_transcript.clear()
         self.task_last_result_round = 0
         if self.pending_prompt_kind == "task":
