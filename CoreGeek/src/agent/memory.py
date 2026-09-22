@@ -68,6 +68,13 @@ class Memory:
     task_rejected_answers: list[str] = field(default_factory=list)
     task_transcript: list[str] = field(default_factory=list)
     task_last_result_round: int = 0
+    task_next_command: str = ""
+    task_last_command: str = ""
+    task_last_command_round: int = 0
+    task_last_command_is_query: bool = False
+    task_command_history: list[str] = field(default_factory=list)
+    task_llm_tool_calls: int = 0
+    task_verified_tool_output: bool = False
     # 8) SOP 知识库
     sops: list[SopRecord] = field(default_factory=list)
     # 9) 上回合发出的指令缓存(兜底重发用)
@@ -131,6 +138,13 @@ class Memory:
         self.task_rejected_answers.clear()
         self.task_transcript.clear()
         self.task_last_result_round = 0
+        self.task_next_command = ""
+        self.task_last_command = ""
+        self.task_last_command_round = 0
+        self.task_last_command_is_query = False
+        self.task_command_history.clear()
+        self.task_llm_tool_calls = 0
+        self.task_verified_tool_output = False
         if self.pending_prompt_kind == "task":
             self.pending_prompt_round = 0
             self.pending_prompt_kind = ""

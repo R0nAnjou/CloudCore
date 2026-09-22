@@ -59,7 +59,7 @@ def night(
         claimed.add(gunner.pos)
 
     # 没有配到武器的角色: 撤回基地附近避险
-    _evacuate_idle_roles(turn, pairs, claimed, commands)
+    _evacuate_idle_roles(turn, pairs, claimed, commands, unavailable_role_ids)
 
 
 def _pair_gunners(
@@ -257,17 +257,20 @@ def _evacuate_idle_roles(
     pairs: list[tuple[Unit, Unit]],
     claimed: set[Pos],
     commands: dict[int, dict[str, Any]],
+    unavailable_role_ids: set[int] | None = None,
 ) -> None:
     from .protocol import station_footprint
 
     assigned = {g.unit_id for _, g in pairs}
+    unavailable_role_ids = unavailable_role_ids or set()
     station = turn.station()
     if station is None:
         return
     footprint = station_footprint(station.pos)
     shelter = footprint[2]  # 基地左下格
     for role in turn.controllable():
-        if role.unit_id in assigned or role.unit_id in commands:
+        if (role.unit_id in assigned or role.unit_id in commands
+                or role.unit_id in unavailable_role_ids):
             continue
         if distance(role.pos, shelter) <= 1:
             continue

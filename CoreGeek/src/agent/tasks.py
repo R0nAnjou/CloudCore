@@ -1,6 +1,8 @@
 """任务引擎：自进化任务、LLM 流水线与长上下文宝藏。"""
+import json
 import logging
 import re
+import shlex
 from typing import Any
 
 from . import protocol as P
@@ -27,6 +29,13 @@ KNOWN_SHOP_ITEMS = {
     P.SMALL_ORDER, P.MIDDLE_ORDER, P.LARGE_ORDER, P.BOSS_ORDER,
 }
 ACTIVE_TASK_STATES = {"accepting", "accepted", "exploring", "answering"}
+MAX_LLM_TOOL_CALLS = 5
+ALLOWED_TASK_TOOLS = {
+    "python", "python3", "curl", "wget", "sqlite3", "jq",
+    "pwd", "ls", "find", "cat", "sed", "grep", "head", "tail",
+    "awk", "cut", "sort", "uniq", "wc", "file", "stat",
+    "sha256sum", "sha512sum", "sha1sum", "md5sum", "openssl", "base64", "printenv",
+}
 
 
 def pioneer(
@@ -177,17 +186,39 @@ def _task_pipeline(
     if not desc:
         return "", ""
 
-    if memory.task_steps_tried and turn.last_cmd_result and memory.task_last_result_round != turn.round_no:
-        memory.task_transcript.append(
-            f"步骤{memory.task_steps_tried}输出:\n{turn.last_cmd_result[:12000]}"
-        )
-        memory.task_last_result_round = turn.round_no
+    if memory.task_last_command_round:
+        if turn.last_cmd_result and memory.task_last_result_round != turn.round_no:
+            query_succeeded = _successful_query_result(turn.last_cmd_result)
+            memory.task_transcript.append(
+                f"命令{memory.task_steps_tried}: {memory.task_last_command}\n"
+                f"结果:\n{turn.last_cmd_result[:16000]}"
+            )
+            if memory.task_last_command_is_query:
+                if query_succeeded:
+                    memory.task_verified_tool_output = True
+                else:
+                    memory.task_transcript.append(
+                        "这条查询没有成功返回有效数据；不要据此猜答案，请换一种查询方式。"
+                    )
+            memory.task_last_result_round = turn.round_no
+            memory.task_last_command_round = 0
+            memory.task_last_command = ""
+            memory.task_last_command_is_query = False
+            LOGGER.info("task sandbox result received (success=%s, %d chars)",
+                        query_succeeded, len(turn.last_cmd_result))
+        elif turn.round_no - memory.task_last_command_round <= 1:
+            return "", ""
+        else:
+            memory.task_transcript.append(
+                f"命令{memory.task_steps_tried}: {memory.task_last_command}\n"
+                "结果: 沙盒未返回结果，请改用其他查询方式。"
+            )
+            memory.task_last_command_round = 0
+            memory.task_last_command = ""
+            memory.task_last_command_is_query = False
 
     if memory.task_state == "accepted":
-        sop = memory.find_sop(desc)
-        if sop is not None and sop.fingerprint == desc and sop.answer_hint:
-            memory.task_answer = sop.answer_hint
-        # 相似任务的答案不能直接用于当前任务；先读取当前沙盒材料。
+        # 即使任务描述相同，沙盒数据也可能变化；不能直接提交历史答案。
         memory.task_state = "exploring"
 
     if memory.task_state == "answering":
@@ -203,16 +234,56 @@ def _task_pipeline(
     if memory.pending_prompt_kind == "task":
         return "", ""
 
+    if memory.task_next_command:
+        command = memory.task_next_command
+        memory.task_next_command = ""
+        memory.task_llm_tool_calls += 1
+        return "", _issue_task_command(turn, memory, command, is_query=True)
+
     next_cmd = _next_explore_command(memory, desc)
     if next_cmd is not None:
-        memory.task_steps_tried += 1
-        return "", next_cmd
+        return "", _issue_task_command(turn, memory, next_cmd)
 
     return _request_task_llm(turn, memory, desc, memory.find_sop(desc)), ""
 
 
+def _issue_task_command(
+    turn: P.Turn, memory: Memory, command: str, *, is_query: bool = False,
+) -> str:
+    memory.task_steps_tried += 1
+    memory.task_last_command = command
+    memory.task_last_command_round = turn.round_no
+    memory.task_last_command_is_query = is_query
+    memory.task_command_history.append(command)
+    LOGGER.info("task sandbox command issued (step %d, tool %s, %d chars)",
+                memory.task_steps_tried, command.split(maxsplit=1)[0], len(command))
+    return command
+
+
+def _successful_query_result(result: str) -> bool:
+    match = re.match(r"^\[exitCode:(-?\d+)\]\r?\n(.*)$", result, re.DOTALL)
+    return bool(match and int(match.group(1)) == 0 and match.group(2).strip())
+
+
+def _task_rounds_left(turn: P.Turn, memory: Memory) -> int | None:
+    task = next((item for item in turn.player_tasks if item.position == memory.task_point), None)
+    if task is None or task.timeout_rounds <= 0:
+        return None
+    return max(0, task.timeout_rounds - (turn.round_no - memory.task_started_round))
+
+
+def _tool_calls_left(turn: P.Turn, memory: Memory, *, responding: bool = False) -> int:
+    left = max(0, MAX_LLM_TOOL_CALLS - memory.task_llm_tool_calls)
+    rounds_left = _task_rounds_left(turn, memory)
+    if rounds_left is None:
+        return left
+    # 发 prompt 后至少还需 CMD 回复、执行结果、FINAL 回复三个回合。
+    reserve = 1 if responding else 2
+    return min(left, max(0, (rounds_left - reserve) // 2))
+
+
 def _next_explore_command(memory: Memory, desc: str) -> str | None:
-    """先发现任务文件，再读取候选文档；所有输出都会累计进 prompt。"""
+    """只做最低限度的文档发现；后续命令由任务反馈驱动。"""
     step = memory.task_steps_tried
     local_target = _extract_local_target(desc)
     if step == 0:
@@ -228,21 +299,6 @@ def _next_explore_command(memory: Memory, desc: str) -> str | None:
             "find . -maxdepth 4 -type f "
             "\\( -iname '*.md' -o -iname '*.txt' -o -iname '*.json' \\) "
             "-print -exec sed -n '1,160p' {} \\; 2>/dev/null | head -1200"
-        )
-    if not memory.task_rejected_answers:
-        return None
-    if step == 2 and local_target:
-        filename = local_target.rsplit("/", 1)[-1]
-        return (
-            f"find . -maxdepth 5 -type f -name '{filename}' "
-            "-print -exec sed -n '241,800p' {} \\; 2>/dev/null | head -600"
-        )
-    if step <= 3:
-        return (
-            "find . -maxdepth 5 -type f "
-            "\\( -iname '*.md' -o -iname '*.txt' -o -iname '*.json' "
-            "-o -iname '*.yaml' -o -iname '*.yml' \\) "
-            "-print -exec sed -n '1,240p' {} \\; 2>/dev/null | head -1200"
         )
     return None
 
@@ -270,23 +326,98 @@ def _request_task_llm(
     prior = ""
     if sop is not None:
         prior = (
-            "\n--- 相似任务经验（只作参考，必须按当前参数改写） ---\n"
-            f"任务: {sop.fingerprint}\n答案: {sop.answer_hint}\n"
+            "\n--- 相似任务经验（仅供选择查询步骤，答案可能已过期） ---\n"
+            f"任务: {sop.fingerprint}\n曾用命令: {sop.steps[:5]}\n"
         )
     rejected = "\n".join(memory.task_rejected_answers[-3:])
     if rejected:
         prior += f"\n--- 已被判错误或未完成的答案（禁止原样重复） ---\n{rejected}\n"
+    available_calls = _tool_calls_left(turn, memory)
+    if available_calls == 0:
+        next_action = "剩余回合不足以继续查询；请尽快给出最有根据的 FINAL，不要使用占位值。"
+    elif not memory.task_verified_tool_output:
+        next_action = "尚未取得成功的题目查询结果，本次必须先给出一条沙盒查询命令。"
+    else:
+        next_action = "若证据不足可继续查询；只有真实结果足以确定全部字段时才给 FINAL。"
     return (
-        "你是游戏内任务求解器。请根据当前任务、沙盒输出和相似任务经验，直接输出可提交的完整答案。"
-        "不要解释，不要添加 Markdown 围栏；必须覆盖任务要求的所有字段。\n"
+        "你是游戏内任务求解器。沙盒可执行基础 shell/Python 命令且无外网。"
+        "先依据任务文档实际查询 API、数据文件或计算 token；不能猜测数值，也不能用 unknown/placeholder 充数。"
+        "每次只返回一行，二选一：CMD: <一条只读 shell 命令> 或 FINAL: <完整提交答案>。"
+        "不要解释、不要 Markdown 围栏。CMD 会由 executeCmd 执行，结果在下一次消息中给你。"
+        "命令不要修改/删除文件、不要访问外网、不要用管道或分号；"
+        "URL 含 & 时须用引号包住。复杂计算可用 python3 -c；哈希可用 sha256sum 等工具。"
+        f"{next_action}最多还能执行 {available_calls} 条自选命令。\n"
         f"--- 当前任务 ---\n{desc}\n"
         f"--- 沙盒探索记录 ---\n{transcript}\n"
-        f"{prior}最终答案:"
+        f"{prior}下一步:"
     )
 
 
 def _extract_steps(memory: Memory) -> list[str]:
-    return [entry.split("输出:", 1)[0] for entry in memory.task_transcript]
+    return list(memory.task_command_history)
+
+
+def _parse_task_llm_output(resp: str) -> tuple[str, str]:
+    value = resp.strip()
+    fenced = re.fullmatch(r"```(?:json|text|bash|sh)?\s*\n(.*?)\n```", value, re.DOTALL | re.IGNORECASE)
+    if fenced:
+        value = fenced.group(1).strip()
+    try:
+        parsed = json.loads(value)
+    except (ValueError, TypeError):
+        parsed = None
+    if isinstance(parsed, dict):
+        kind = str(parsed.get("kind") or parsed.get("type") or "").lower()
+        if kind in {"command", "cmd", "executecmd"}:
+            return "command", str(parsed.get("command") or parsed.get("cmd") or "").strip()
+        if kind in {"answer", "final"}:
+            answer = parsed.get("answer", "")
+            return "answer", answer.strip() if isinstance(answer, str) else json.dumps(answer, ensure_ascii=False)
+        return "answer", json.dumps(parsed, ensure_ascii=False)
+    match = re.match(r"^(?:CMD|COMMAND|EXECUTECMD)\s*[:：]\s*(.*)$", value, re.IGNORECASE | re.DOTALL)
+    if match:
+        return "command", match.group(1).strip()
+    match = re.match(r"^(?:FINAL|ANSWER)\s*[:：]\s*(.*)$", value, re.IGNORECASE | re.DOTALL)
+    if match:
+        return "answer", match.group(1).strip()
+    return "answer", value
+
+
+def _safe_task_command(command: str) -> bool:
+    """限制 LLM 只能给沙盒发送单条查询/计算命令。"""
+    if (not command or len(command) > 2000 or "\n" in command or "\r" in command
+            or "$(" in command or "`" in command):
+        return False
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|<>`")
+        lexer.whitespace_split = True
+        lexer.commenters = ""
+        tokens = list(lexer)
+    except ValueError:
+        return False
+    if not tokens or tokens[0].lower() not in ALLOWED_TASK_TOOLS:
+        return False
+    return not any(re.fullmatch(r"[;&|<>`]+", token) for token in tokens)
+
+
+def _answer_has_placeholder(answer: str) -> bool:
+    try:
+        value = json.loads(answer)
+    except (ValueError, TypeError):
+        value = answer
+
+    def is_placeholder(item: Any) -> bool:
+        if isinstance(item, dict):
+            return any(is_placeholder(part) for part in item.values())
+        if isinstance(item, list):
+            return any(is_placeholder(part) for part in item)
+        if not isinstance(item, str):
+            return False
+        text = item.strip().lower()
+        return (text in {"unknown", "todo", "tbd", "xxx", "null", "pending", "n/a"}
+                or text.startswith(("placeholder", "waiting_for_")))
+
+    return is_placeholder(value)
 
 
 def _consume_llm_resp(turn: P.Turn, memory: Memory, resp: str) -> None:
@@ -294,12 +425,28 @@ def _consume_llm_resp(turn: P.Turn, memory: Memory, resp: str) -> None:
         return
     kind = memory.pending_prompt_kind
     if kind == "task" and memory.task_state in ACTIVE_TASK_STATES:
-        answer = resp.strip()
-        if answer and answer not in memory.task_rejected_answers:
-            memory.task_answer = answer
-            LOGGER.info("LLM produced task answer (%d chars)", len(answer))
+        response_kind, value = _parse_task_llm_output(resp)
+        if response_kind == "command":
+            if _tool_calls_left(turn, memory, responding=True) == 0:
+                memory.task_transcript.append("查询额度或剩余回合不足；请依据已有结果尽快作答。")
+            elif value in memory.task_command_history:
+                memory.task_transcript.append("这条命令已经执行过，请换一种查询方式。")
+            elif _safe_task_command(value):
+                memory.task_next_command = value
+                LOGGER.info("LLM requested task sandbox command (%d chars)", len(value))
+            else:
+                memory.task_transcript.append("命令格式不安全或不受支持；请使用单条只读查询命令。")
+                LOGGER.warning("LLM requested unsupported task command")
+        elif not value or value in memory.task_rejected_answers or _answer_has_placeholder(value):
+            memory.task_transcript.append("答案为空、包含占位值或此前已被判错；请继续查询证据。")
+            LOGGER.warning("LLM returned empty, placeholder, or previously rejected task answer")
+        elif not memory.task_verified_tool_output and (_task_rounds_left(turn, memory) is None
+                or _task_rounds_left(turn, memory) > 2):
+            memory.task_transcript.append("尚未取得成功的题目查询结果；请先给出 CMD，不要猜最终答案。")
+            LOGGER.warning("LLM attempted task answer before querying sandbox")
         else:
-            LOGGER.warning("LLM returned empty or previously rejected task answer")
+            memory.task_answer = value
+            LOGGER.info("LLM produced task answer (%d chars)", len(value))
         memory.pending_prompt_round = 0
         memory.pending_prompt_kind = ""
     elif kind == "treasure":
