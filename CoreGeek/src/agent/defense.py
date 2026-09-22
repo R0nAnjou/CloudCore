@@ -6,6 +6,7 @@
 - 火箭: 落点中心 20 + 周围 8 格溅射 10, 3 回合冷却。
 伤害本回合结束统一结算 -> 集火判断按"累计伤害 >= HP"的最小火力集合。
 """
+from itertools import combinations, permutations
 from typing import Any
 
 from . import protocol as P
@@ -66,24 +67,27 @@ def _pair_gunners(
     turn: P.Turn,
     unavailable_role_ids: set[int] | None = None,
 ) -> list[tuple[Unit, Unit]]:
-    """角色-武器配对: 就近贪心(角色数 <= 武器数)。"""
+    """最多三人三炮，穷举配对以优先保证本回合能开火。"""
     unavailable_role_ids = unavailable_role_ids or set()
     roles = [r for r in turn.controllable() if r.unit_id not in unavailable_role_ids]
     towers = list(turn.weapons())
-    pairs: list[tuple[Unit, Unit]] = []
-    used_roles: set[int] = set()
-    for tower in towers:
-        best_role, best_d = None, 10**9
-        for role in roles:
-            if role.unit_id in used_roles:
-                continue
-            d = distance(role.pos, tower.pos)
-            if d < best_d:
-                best_role, best_d = role, d
-        if best_role is not None:
-            used_roles.add(best_role.unit_id)
-            pairs.append((tower, best_role))
-    return pairs
+    n = min(len(roles), len(towers))
+    if n == 0:
+        return []
+    priority = {ROCKET: 3, RAILGUN: 2, GATLING: 1}
+    best_pairs: list[tuple[Unit, Unit]] = []
+    best_score = -10**9
+    for selected_towers in combinations(towers, n):
+        for selected_roles in permutations(roles, n):
+            pairs = list(zip(selected_towers, selected_roles))
+            score = sum(
+                (100 + 5 * priority.get(tower.kind, 0)) if distance(tower.pos, role.pos) <= 1
+                else (2 * priority.get(tower.kind, 0) - 10 * distance(tower.pos, role.pos))
+                for tower, role in pairs
+            )
+            if score > best_score:
+                best_pairs, best_score = pairs, score
+    return best_pairs
 
 
 def _choose_targets(

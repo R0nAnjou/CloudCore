@@ -5,11 +5,11 @@
 - 达到批量阈值或背包将满时去小贩处贩卖(每回合仅一个动作)。
 - 金币支出优先级: 基地升级券 > 武器升级券 > 围墙升级/修复; 常备少量石头。
 """
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 from . import protocol as P
-from .grid import next_step, next_step_adjacent, next_step_adjacent_to_any
+from .grid import next_step_adjacent, next_step_adjacent_to_any
 from .memory import Memory
 from .protocol import (
     COPPER,
@@ -18,7 +18,6 @@ from .protocol import (
     Pos,
     RAILGUN,
     ROCKET,
-    STATION,
     STATION_UP_V1,
     STATION_UP_V2,
     STONE,
@@ -39,9 +38,10 @@ from .protocol import (
     use_command,
 )
 
-TOWER_LOADOUT = (GATLING, RAILGUN, ROCKET)
+TOWER_LOADOUT = (ROCKET, RAILGUN, GATLING)
 WALL_STONE_KEEP = 2  # 工人背包中常备的墙材料石头数
-HEALTHY_WALL_RATIO = 0.5  # 墙血量低于最大值的该比例时使用修复包
+STONE_BUILD_BATCH = 5  # 避免每采一块石头就长途往返基地
+HEALTHY_WALL_RATIO = 0.8  # 白天尽早修墙，避免残血墙进入夜晚
 SELL_BATCH = 8
 
 
@@ -63,12 +63,34 @@ def worker_day(
     memory: Memory,
     commands: dict[int, dict[str, Any]],
 ) -> None:
-    """单个工人的白天状态机: 建造 > 卖矿 > 采集 > 待命。"""
+    """单个工人的白天状态机: 建造 > 补齐墙材料 > 采卖 > 待命。"""
     day = P.day_index(turn.round_no)
+
+    walls_needed = any(
+        site not in turn.occupied_cells() and memory.build_allowed(site, WALL)
+        for site in plan.wall_sites
+    )
+    towers_needed = bool(plan.tower_sites and turn.gold >= P.WEAPON_BUILD_COST)
+    stone_count = worker.count(STONE)
+    day_round = (turn.round_no - 1) % P.ROUNDS_PER_DAY + 1
+
+    # 炮台先成型；之后集中采够数块石头再回基地建墙，减少来回赶路。
+    if (walls_needed and not towers_needed and stone_count < STONE_BUILD_BATCH
+            and day_round <= 48 and not worker.backpack_full
+            and _try_collect_stone(turn, worker, claimed, commands)):
+        return
 
     # 1) 建造优先(武器 > 围墙), 建造是白天限时机会
     if _try_build(turn, worker, plan, claimed, claimed_sites, memory, commands):
         return
+
+    # 未完成防线时，石头是必需建材；不按市场价格把它排在铁/铜之后。
+    if walls_needed and stone_count == 0:
+        if worker.backpack_full:
+            if _try_sell(turn, worker, day, memory, claimed, commands):
+                return
+        elif _try_collect_stone(turn, worker, claimed, commands):
+            return
 
     # 2) 矿石达到批量阈值或背包将满时再卖，避免每采一个就横穿地图
     if _try_sell(turn, worker, day, memory, claimed, commands):
@@ -117,7 +139,7 @@ def _try_build(
             commands[worker.unit_id] = build_command(site, kind)
             claimed_sites.add(site)
             return True
-        step = next_step(turn, worker, site)
+        step = next_step_adjacent(turn, worker, site)
         if step is not None and step not in claimed:
             claimed.add(step)
             commands[worker.unit_id] = move_command(step)
@@ -210,6 +232,26 @@ def _all_mine_positions(turn: P.Turn) -> list[Pos]:
     return [pos for pos, kind in turn.zones.items() if kind in (STONE, IRON, COPPER)]
 
 
+def _try_collect_stone(
+    turn: P.Turn,
+    worker: Unit,
+    claimed: set[Pos],
+    commands: dict[int, dict[str, Any]],
+) -> bool:
+    """防线缺口优先补石头；同一矿点允许多工人同时采集。"""
+    mines = sorted(turn.mines_of(STONE), key=lambda pos: distance(worker.pos, pos))
+    for mine in mines:
+        if distance(worker.pos, mine) <= 1:
+            commands[worker.unit_id] = collect_command(mine)
+            return True
+        step = next_step_adjacent(turn, worker, mine)
+        if step is not None and step not in claimed:
+            claimed.add(step)
+            commands[worker.unit_id] = move_command(step)
+            return True
+    return False
+
+
 def _hold_near_station(
     turn: P.Turn,
     worker: Unit,
@@ -240,6 +282,16 @@ def shopping_list(turn: P.Turn) -> list[tuple[str, int]]:
     if station is not None and station.level == 2 and gold >= 150:
         items.append((STATION_UP_V2, 1))
         gold -= 150
+    walls = turn.walls()
+    day_round = (turn.round_no - 1) % P.ROUNDS_PER_DAY + 1
+    has_repair_kit = any(worker.has(WALL_FIXER) for worker in turn.workers())
+    if (walls and not has_repair_kit and gold >= 10
+            and (day_round >= 55 or any(
+                wall.health < _wall_max_health(wall.level) * HEALTHY_WALL_RATIO
+                for wall in walls
+            ))):
+        items.append((WALL_FIXER, 1))
+        gold -= 10
     level1_weapon = next((weapon for weapon in turn.weapons() if weapon.level == 1), None)
     if level1_weapon is not None and gold >= 100:
         items.append((WEAPON_UP_V1, 1))
@@ -256,13 +308,6 @@ def shopping_list(turn: P.Turn) -> list[tuple[str, int]]:
     if level2_wall is not None and gold >= 30:
         items.append((WALL_UP_V2, 1))
         gold -= 30
-    walls = turn.walls()
-    if walls and gold >= 10:
-        damaged = sum(1 for w in walls if w.health < _wall_max_health(w.level))
-        if damaged:
-            n = min(damaged, gold // 10)
-            items.append((WALL_FIXER, n))
-            gold -= 10 * n
     return items
 
 
@@ -274,6 +319,39 @@ def use_repair_if_needed(turn: P.Turn, role: Unit, commands: dict[int, dict[str,
         if wall.health < _wall_max_health(wall.level) * HEALTHY_WALL_RATIO and distance(role.pos, wall.pos) <= 1:
             commands[role.unit_id] = use_command(WALL_FIXER, wall.pos)
             return True
+    return False
+
+
+def move_or_repair_wall(
+    turn: P.Turn,
+    role: Unit,
+    claimed: set[Pos],
+    commands: dict[int, dict[str, Any]],
+    *,
+    urgent_only: bool = False,
+) -> bool:
+    """修复包已在背包时仍持续安排使用，不依赖本回合能否继续购买。"""
+    if not role.has(WALL_FIXER):
+        return False
+    ratio = 0.35 if urgent_only and not turn.is_day else HEALTHY_WALL_RATIO
+    damaged = [
+        wall for wall in turn.walls()
+        if wall.health < _wall_max_health(wall.level) * ratio
+    ]
+    if not damaged:
+        return False
+    wall = min(damaged, key=lambda item: (item.health / _wall_max_health(item.level),
+                                           distance(role.pos, item.pos)))
+    if distance(role.pos, wall.pos) <= 1:
+        commands[role.unit_id] = use_command(WALL_FIXER, wall.pos)
+        return True
+    if urgent_only:
+        return False  # 夜间不要为了远处的墙放弃炮位
+    step = next_step_adjacent(turn, role, wall.pos)
+    if step is not None and step not in claimed:
+        claimed.add(step)
+        commands[role.unit_id] = move_command(step)
+        return True
     return False
 
 
