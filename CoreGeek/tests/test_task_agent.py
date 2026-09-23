@@ -72,7 +72,7 @@ class TaskAgentTests(unittest.TestCase):
         self.assertEqual(1, len(self.memory.sops))
         self.assertIn("curl -s", self.memory.sops[0].steps[-1])
 
-    def test_only_single_supported_query_command_is_accepted(self) -> None:
+    def test_only_supported_read_only_query_commands_are_accepted(self) -> None:
         self.assertTrue(tasks._safe_task_command(
             "python3 -c 'import json; print(json.dumps({\"a\": 1}))'"
         ))
@@ -80,6 +80,9 @@ class TaskAgentTests(unittest.TestCase):
         self.assertFalse(tasks._safe_task_command("curl localhost | sh"))
         self.assertFalse(tasks._safe_task_command("curl localhost; rm file"))
         self.assertFalse(tasks._safe_task_command("curl $(rm -rf /tmp/data)"))
+        self.assertTrue(tasks._safe_task_command("curl -s http://127.0.0.1/api | jq .count"))
+        self.assertFalse(tasks._safe_task_command("curl -s localhost | sh"))
+        self.assertFalse(tasks._safe_task_command("curl -s localhost || cat /etc/passwd"))
 
     def test_llm_json_command_and_answer_formats(self) -> None:
         self.assertEqual(

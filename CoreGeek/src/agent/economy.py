@@ -38,7 +38,7 @@ from .protocol import (
     use_command,
 )
 
-TOWER_LOADOUT = (ROCKET, RAILGUN, GATLING)
+TOWER_LOADOUT = (ROCKET, ROCKET, ROCKET)
 WALL_STONE_KEEP = 2  # 工人背包中常备的墙材料石头数
 STONE_BUILD_BATCH = 5  # 避免每采一块石头就长途往返基地
 HEALTHY_WALL_RATIO = 0.8  # 白天尽早修墙，避免残血墙进入夜晚
@@ -62,9 +62,20 @@ def worker_day(
     claimed_sites: set[Pos],
     memory: Memory,
     commands: dict[int, dict[str, Any]],
+    *,
+    income_only: bool = False,
 ) -> None:
-    """单个工人的白天状态机: 建造 > 补齐墙材料 > 采卖 > 待命。"""
+    """建造工补防线，矿工专注高价值矿和现金流。"""
     day = P.day_index(turn.round_no)
+    if income_only:
+        if _try_sell(turn, worker, day, memory, claimed, commands, cash_first=True, stone_keep=0):
+            return
+        if not worker.backpack_full and _try_collect_income(
+            turn, worker, day, memory, claimed, commands,
+        ):
+            return
+        _hold_near_station(turn, worker, claimed, commands)
+        return
 
     walls_needed = any(
         site not in turn.occupied_cells() and memory.build_allowed(site, WALL)
@@ -74,9 +85,15 @@ def worker_day(
     stone_count = worker.count(STONE)
     day_round = (turn.round_no - 1) % P.ROUNDS_PER_DAY + 1
 
-    # 炮台先成型；之后集中采够数块石头再回基地建墙，减少来回赶路。
-    if (walls_needed and not towers_needed and stone_count < STONE_BUILD_BATCH
-            and day_round <= 48 and not worker.backpack_full
+    # 持续消耗整批石头，不能建一块后又返回矿点补到阈值。
+    mode = memory.worker_modes.setdefault(worker.unit_id, "build" if stone_count else "collect")
+    if stone_count == 0:
+        mode = "collect"
+    if stone_count >= STONE_BUILD_BATCH or day_round >= 48:
+        mode = "build"
+    memory.worker_modes[worker.unit_id] = mode
+    if (walls_needed and not towers_needed and mode == "collect"
+            and not worker.backpack_full
             and _try_collect_stone(turn, worker, claimed, commands)):
         return
 
@@ -138,8 +155,9 @@ def _try_build(
         if distance(worker.pos, site) <= 1:
             commands[worker.unit_id] = build_command(site, kind)
             claimed_sites.add(site)
+            claimed.add(site)
             return True
-        step = next_step_adjacent(turn, worker, site)
+        step = next_step_adjacent(turn, worker, site, reserved=claimed)
         if step is not None and step not in claimed:
             claimed.add(step)
             commands[worker.unit_id] = move_command(step)
@@ -155,6 +173,9 @@ def _try_sell(
     memory: Memory,
     claimed: set[Pos],
     commands: dict[int, dict[str, Any]],
+    *,
+    cash_first: bool = False,
+    stone_keep: int = WALL_STONE_KEEP,
 ) -> bool:
     vendor = turn.vendor_pos()
     if vendor is None:
@@ -163,27 +184,32 @@ def _try_sell(
     best_ore, best_num, best_value = None, 0, 0
     for ore in (COPPER, IRON, STONE):
         # 明日停产而今日仍可采时先囤货，等价格上涨后再卖。
-        if not memory.ore_blocked(ore, day) and memory.ore_blocked(ore, day + 1):
+        if (not cash_first and turn.gold >= 150
+                and not memory.ore_blocked(ore, day) and memory.ore_blocked(ore, day + 1)):
             continue
         num = worker.count(ore)
         if ore == STONE:
-            num = max(0, num - WALL_STONE_KEEP)
+            num = max(0, num - stone_keep)
         price = turn.vendor_prices.get(ore, 0)
         if num > 0 and num * price > best_value:
             best_ore, best_num, best_value = ore, num, num * price
     if best_ore is None:
         return False
     total_sellable = sum(
-        max(0, worker.count(ore) - (WALL_STONE_KEEP if ore == STONE else 0))
+        max(0, worker.count(ore) - (stone_keep if ore == STONE else 0))
         for ore in (COPPER, IRON, STONE)
     )
     nearly_full = worker.capacity is not None and len(worker.backpack) >= int(worker.capacity * 0.8)
-    if total_sellable < SELL_BATCH and not nearly_full:
+    needs_cash = cash_first and (
+        turn.gold < 100 <= turn.gold + best_value
+        or (turn.round_no - 1) % P.ROUNDS_PER_DAY + 1 >= 45
+    )
+    if total_sellable < SELL_BATCH and not nearly_full and not needs_cash:
         return False
     if distance(worker.pos, vendor) <= 1:
         commands[worker.unit_id] = sell_command(best_ore, best_num)
         return True
-    step = next_step_adjacent(turn, worker, vendor)
+    step = next_step_adjacent(turn, worker, vendor, reserved=claimed)
     if step is not None and step not in claimed:
         claimed.add(step)
         commands[worker.unit_id] = move_command(step)
@@ -220,7 +246,7 @@ def _try_collect(
             claimed.add(mine)
             commands[worker.unit_id] = collect_command(mine)
             return True
-        step = next_step_adjacent(turn, worker, mine)
+        step = next_step_adjacent(turn, worker, mine, reserved=claimed)
         if step is not None and step not in claimed:
             claimed.add(step)
             commands[worker.unit_id] = move_command(step)
@@ -230,6 +256,34 @@ def _try_collect(
 
 def _all_mine_positions(turn: P.Turn) -> list[Pos]:
     return [pos for pos, kind in turn.zones.items() if kind in (STONE, IRON, COPPER)]
+
+
+def _try_collect_income(
+    turn: P.Turn,
+    worker: Unit,
+    day: int,
+    memory: Memory,
+    claimed: set[Pos],
+    commands: dict[int, dict[str, Any]],
+) -> bool:
+    """矿工优先铜/铁，避免因为近处石矿而整天没有金币收入。"""
+    mines = [
+        pos for pos, ore in turn.zones.items()
+        if ore in (COPPER, IRON) and not memory.ore_blocked(ore, day)
+    ]
+    vendor = turn.vendor_pos() or worker.pos
+    mines.sort(key=lambda pos: -turn.vendor_prices.get(turn.zones[pos], 0) /
+               (distance(worker.pos, pos) + distance(pos, vendor) + SELL_BATCH))
+    for mine in mines:
+        if distance(worker.pos, mine) <= 1:
+            commands[worker.unit_id] = collect_command(mine)
+            return True
+        step = next_step_adjacent(turn, worker, mine, reserved=claimed)
+        if step is not None and step not in claimed:
+            claimed.add(step)
+            commands[worker.unit_id] = move_command(step)
+            return True
+    return _try_collect(turn, worker, day, memory, claimed, commands)
 
 
 def _try_collect_stone(
@@ -244,7 +298,7 @@ def _try_collect_stone(
         if distance(worker.pos, mine) <= 1:
             commands[worker.unit_id] = collect_command(mine)
             return True
-        step = next_step_adjacent(turn, worker, mine)
+        step = next_step_adjacent(turn, worker, mine, reserved=claimed)
         if step is not None and step not in claimed:
             claimed.add(step)
             commands[worker.unit_id] = move_command(step)
@@ -265,23 +319,32 @@ def _hold_near_station(
     target = footprint[2]  # 基地左下格附近
     if distance(worker.pos, target) <= 1:
         return
-    step = next_step_adjacent_to_any(turn, worker, list(footprint))
+    step = next_step_adjacent_to_any(turn, worker, list(footprint), reserved=claimed)
     if step is not None and step not in claimed:
         claimed.add(step)
         commands[worker.unit_id] = move_command(step)
 
 
 def shopping_list(turn: P.Turn) -> list[tuple[str, int]]:
-    """按金币余量生成购物清单(由主决策派最近的持有者去武器商店购买)。"""
+    """残血基地优先救命，健康基地优先提升火力；购物必须包含实际兑现。"""
     items: list[tuple[str, int]] = []
     gold = turn.gold
     station = turn.station()
-    if station is not None and station.level == 1 and gold >= 100:
-        items.append((STATION_UP_V1, 1))
-        gold -= 100
-    if station is not None and station.level == 2 and gold >= 150:
-        items.append((STATION_UP_V2, 1))
-        gold -= 150
+    def add(name: str, price: int) -> bool:
+        nonlocal gold
+        price = turn.shop_prices.get(name, price)
+        if gold < price or any(role.has(name) for role in turn.controllable()):
+            return False
+        items.append((name, 1))
+        gold -= price
+        return True
+
+    urgent_station = station is not None and station.health < 1500 * max(1, station.level) * 0.65
+    station_item = (STATION_UP_V1, 100) if station and station.level == 1 else (STATION_UP_V2, 150)
+    if urgent_station and station.level < 3:
+        add(*station_item)
+    if any(worker.health < 132 for worker in turn.workers()):
+        add(P.MEDICINE, 10)
     walls = turn.walls()
     day_round = (turn.round_no - 1) % P.ROUNDS_PER_DAY + 1
     has_repair_kit = any(worker.has(WALL_FIXER) for worker in turn.workers())
@@ -290,22 +353,23 @@ def shopping_list(turn: P.Turn) -> list[tuple[str, int]]:
                 wall.health < _wall_max_health(wall.level) * HEALTHY_WALL_RATIO
                 for wall in walls
             ))):
-        items.append((WALL_FIXER, 1))
-        gold -= 10
+        add(WALL_FIXER, 10)
     level1_weapon = next((weapon for weapon in turn.weapons() if weapon.level == 1), None)
-    if level1_weapon is not None and gold >= 100:
-        items.append((WEAPON_UP_V1, 1))
-        gold -= 100
+    if level1_weapon is not None:
+        add(WEAPON_UP_V1, 100)
+    if station is not None and station.level == 1 and not urgent_station:
+        add(STATION_UP_V1, 100)
     level2_weapon = next((weapon for weapon in turn.weapons() if weapon.level == 2), None)
-    if level2_weapon is not None and gold >= 150:
-        items.append((WEAPON_UP_V2, 1))
-        gold -= 150
+    if level2_weapon is not None:
+        add(WEAPON_UP_V2, 150)
+    if station is not None and station.level == 2 and not urgent_station:
+        add(STATION_UP_V2, 150)
     level1_wall = next((wall for wall in turn.walls() if wall.level == 1), None)
-    if level1_wall is not None and gold >= 20:
+    if station is not None and station.level >= 2 and level1_wall is not None and gold >= 120:
         items.append((WALL_UP_V1, 1))
         gold -= 20
     level2_wall = next((wall for wall in turn.walls() if wall.level == 2), None)
-    if level2_wall is not None and gold >= 30:
+    if station is not None and station.level >= 2 and level2_wall is not None and gold >= 130:
         items.append((WALL_UP_V2, 1))
         gold -= 30
     return items
@@ -329,6 +393,7 @@ def move_or_repair_wall(
     commands: dict[int, dict[str, Any]],
     *,
     urgent_only: bool = False,
+    allow_move: bool = True,
 ) -> bool:
     """修复包已在背包时仍持续安排使用，不依赖本回合能否继续购买。"""
     if not role.has(WALL_FIXER):
@@ -336,24 +401,39 @@ def move_or_repair_wall(
     ratio = 0.35 if urgent_only and not turn.is_day else HEALTHY_WALL_RATIO
     damaged = [
         wall for wall in turn.walls()
-        if wall.health < _wall_max_health(wall.level) * ratio
+        if (wall.health < _wall_max_health(wall.level) * ratio
+            or wall.health <= 2 * incoming_wall_damage(turn, wall))
+        and (not urgent_only and allow_move or distance(role.pos, wall.pos) <= 1)
+        and wall.pos not in claimed
     ]
     if not damaged:
         return False
-    wall = min(damaged, key=lambda item: (item.health / _wall_max_health(item.level),
-                                           distance(role.pos, item.pos)))
+    wall = min(damaged, key=lambda item: (
+        distance(role.pos, item.pos) > 1,
+        item.health / max(1, incoming_wall_damage(turn, item)),
+        item.health / _wall_max_health(item.level), distance(role.pos, item.pos),
+    ))
     if distance(role.pos, wall.pos) <= 1:
         commands[role.unit_id] = use_command(WALL_FIXER, wall.pos)
+        claimed.add(wall.pos)
         return True
-    if urgent_only:
+    if urgent_only or not allow_move:
         return False  # 夜间不要为了远处的墙放弃炮位
-    step = next_step_adjacent(turn, role, wall.pos)
+    step = next_step_adjacent(turn, role, wall.pos, reserved=claimed)
     if step is not None and step not in claimed:
         claimed.add(step)
         commands[role.unit_id] = move_command(step)
+        claimed.add(wall.pos)
         return True
     return False
 
 
 def _wall_max_health(level: int) -> int:
     return (1000, 1500, 2000)[min(max(level, 1), 3) - 1]
+
+
+def incoming_wall_damage(turn: P.Turn, wall: Unit) -> int:
+    powers = {P.SMALL_ROBOT: 5, P.MIDDLE_ROBOT: 10, P.LARGE_ROBOT: 20, P.BOSS_ROBOT: 40}
+    return sum(powers.get(robot.kind, 5) for robot in turn.robots
+               if distance(robot.pos, wall.pos) <= 3
+               and (not robot.target_team or robot.target_team == turn.team_type))

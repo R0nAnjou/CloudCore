@@ -1,0 +1,274 @@
+"""跨回合验证生产/门禁/冷却调度；此小型执行器不模拟官方机器人战斗。"""
+import json
+import sys
+import unittest
+from dataclasses import replace
+from pathlib import Path
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "src"))
+from agent import brain, defense, economy, grid, protocol as P, tasks
+from agent.memory import Memory
+
+
+class SurvivalLoopTests(unittest.TestCase):
+    def setUp(self):
+        self.sample = P.Turn.load(json.loads((ROOT.parent / "docs/request.txt").read_text(encoding="utf-8")))
+        self.station = self.sample.station()
+        self.worker = self.sample.workers()[0]
+        self.wall = self.sample.walls()[0]
+        self.rocket = replace(self.sample.weapons()[0], kind=P.ROCKET, level=1,
+                              cooldown=0, attack_range=10)
+        self.base = replace(self.sample, round_no=1, is_day=True, gold=0, zones={},
+                            ours=(self.station,), robots=(), enemy_roles=(), player_tasks=(),
+                            phase_task="", llm_resp="", last_cmd_result="", errors=(),
+                            world_official_news="", world_folk_legends="", last_action_results={})
+
+    def apply_day(self, turn, commands):
+        """只实现测试所用的移动、采石、建/拆墙，并验证每步的合法性。"""
+        units = {unit.unit_id: unit for unit in turn.ours}
+        destinations = set()
+        for role_id, command in commands.items():
+            role = units[role_id]
+            action = command["action"]
+            pos = P.Pos.load(command["targetPos"][0])
+            self.assertLessEqual(P.distance(role.pos, pos), 1)
+            if action == "move":
+                self.assertNotIn(pos, destinations)
+                self.assertNotIn(pos, turn.blocked(role))
+                self.assertTrue(turn.land(pos))
+                destinations.add(pos)
+                units[role_id] = replace(role, pos=pos)
+            elif action == "remove":
+                wall = next(unit for unit in units.values() if unit.pos == pos and unit.kind == P.WALL)
+                units.pop(wall.unit_id)
+            elif action == "build":
+                self.assertTrue(turn.is_day)
+                self.assertEqual(P.WALL, command["name"])
+                self.assertNotIn(pos, turn.occupied_cells())
+                self.assertIn(P.STONE, role.backpack)
+                backpack = list(role.backpack)
+                backpack.remove(P.STONE)
+                units[role_id] = replace(role, backpack=tuple(backpack))
+                wall_id = max(units) + 1
+                units[wall_id] = replace(self.wall, unit_id=wall_id, pos=pos, health=1000)
+            elif action == "collect":
+                units[role_id] = replace(role, backpack=role.backpack + (turn.zones[pos],))
+            else:
+                self.fail(f"unexpected command in movement fixture: {command}")
+        return replace(turn, ours=tuple(units.values()))
+
+    def test_builder_consumes_entire_batch_before_mining_again(self):
+        worker = replace(self.worker, pos=P.Pos(5, 5), backpack=(P.STONE,) * 5)
+        sites = tuple(grid.neighbours(worker.pos)[:5])
+        turn = replace(self.base, round_no=20, ours=(self.station, worker),
+                       zones={P.Pos(6, 6): P.STONE})
+        memory = Memory(worker_modes={worker.unit_id: "collect"})
+        for index in range(5):
+            worker = turn.workers()[0]
+            commands = {}
+            economy.worker_day(turn, worker, economy.Plan(wall_sites=sites), set(), set(), memory, commands)
+            self.assertEqual("build", commands[worker.unit_id]["action"], f"batch step {index}")
+            turn = self.apply_day(turn, commands)
+        self.assertEqual(0, turn.workers()[0].count(P.STONE))
+
+    def test_two_day_gate_cycle_including_outside_pioneer_and_blocking_guard(self):
+        self.run_gate_cycle(with_towers=False)
+
+    def test_two_day_gate_cycle_with_full_tower_and_role_loadout(self):
+        self.run_gate_cycle(with_towers=True)
+
+    def run_gate_cycle(self, with_towers):
+        with patch.object(brain, "MEMORY", Memory()):
+            plan = brain._build_plan(self.base)
+            gate = brain._gate_position(self.base)
+            inner = brain._ring(P.station_footprint(self.station.pos), 1)
+            doorway = next(pos for pos in inner if P.distance(pos, gate) <= 1)
+            worker = replace(self.worker, pos=doorway, backpack=(P.STONE,) * 3)
+            outside = P.Pos(gate.x + (gate.x > self.station.pos.x) * 2 - 1,
+                            gate.y + (gate.y > self.station.pos.y) * 2 - 1)
+            pioneer = replace(self.sample.pioneers()[0], pos=outside, backpack=())
+            walls = tuple(replace(self.wall, unit_id=40000+i, pos=pos, health=1000)
+                          for i, pos in enumerate(plan.wall_sites))
+            extras = ()
+            if with_towers:
+                towers = tuple(replace(self.rocket, unit_id=500+i, pos=pos)
+                               for i, pos in enumerate(plan.tower_sites))
+                spare = next(pos for pos in inner if pos != doorway and pos not in plan.tower_sites)
+                second = replace(self.sample.workers()[1], pos=spare, backpack=(P.STONE,) * 3)
+                extras = (*towers, second)
+            turn = replace(self.base, round_no=60, ours=(self.station, worker, pioneer, *walls, *extras))
+            for number in range(60, 71):
+                turn = replace(turn, round_no=number)
+                commands = {}
+                brain._day_phase(turn, commands)
+                brain._resolve_command_conflicts(turn, commands)
+                if not brain._inside_defense(turn, turn.pioneers()[0]):
+                    self.assertFalse(any(c["action"] == "build" and P.Pos.load(c["targetPos"][0]) == gate
+                                         for c in commands.values()))
+                turn = self.apply_day(turn, commands)
+            self.assertTrue(all(brain._inside_defense(turn, role) for role in turn.controllable()))
+            self.assertTrue(any(w.pos == gate for w in turn.walls()))
+
+            mine = outside
+            turn = replace(turn, round_no=131, zones={mine: P.STONE})
+            opened = False
+            collected = False
+            for number in range(131, 150):
+                turn = replace(turn, round_no=number)
+                commands = {}
+                brain._day_phase(turn, commands)
+                opened |= any(c["action"] == "remove" for c in commands.values())
+                collected |= any(c["action"] == "collect" for c in commands.values())
+                turn = self.apply_day(turn, commands)
+            self.assertTrue(opened, "second morning must physically remove the gate wall")
+            self.assertTrue(collected, "the worker must resume outside production")
+            for number in range(190, 201):
+                turn = replace(turn, round_no=number)
+                commands = {}
+                brain._day_phase(turn, commands)
+                turn = self.apply_day(turn, commands)
+            self.assertTrue(any(w.pos == gate for w in turn.walls()), "second night must close gate again")
+
+    def test_build_failure_is_retried_after_backoff(self):
+        memory = Memory(current_round=10)
+        pos = P.Pos(5, 5)
+        memory.note_build_result(pos, P.WALL, False)
+        self.assertFalse(memory.build_allowed(pos, P.WALL))
+        memory.current_round = 30
+        self.assertTrue(memory.build_allowed(pos, P.WALL))
+
+    def test_tower_layout_preserves_access_from_gate_to_every_tower(self):
+        with patch.object(brain, "MEMORY", Memory()):
+            plan = brain._build_plan(self.base)
+            gate = brain._gate_position(self.base)
+            self.assertEqual(3, len(plan.tower_sites))
+            towers = tuple(replace(self.rocket, unit_id=500+i, pos=pos)
+                           for i, pos in enumerate(plan.tower_sites))
+            walls = tuple(replace(self.wall, unit_id=40000+i, pos=pos)
+                          for i, pos in enumerate(plan.wall_sites))
+            worker = replace(self.worker, pos=gate, backpack=())
+            turn = replace(self.base, ours=(self.station, worker, *towers, *walls))
+            for tower in towers:
+                path = grid.path_to_any(turn, worker, grid.adjacent_stands(turn, worker, (tower.pos,)))
+                self.assertIsNotNone(path, f"tower at {tower.pos} lost its access route")
+
+    def test_one_role_rotates_three_rockets_by_reported_cooldown(self):
+        worker = replace(self.worker, pos=P.Pos(5, 5), backpack=())
+        robots = (P.Robot(1, P.Pos(7, 7), P.BOSS_ROBOT, 800, False, self.base.team_type),)
+        towers = tuple(replace(self.rocket, unit_id=500+i, pos=pos)
+                       for i, pos in enumerate((P.Pos(4, 5), P.Pos(5, 4), P.Pos(6, 5))))
+        fired = []
+        for active in range(3):
+            current = tuple(replace(t, cooldown=0 if i == active else 2) for i, t in enumerate(towers))
+            turn = replace(self.base, round_no=71+active, is_day=False,
+                           ours=(self.station, worker, *current), robots=robots)
+            commands = {}
+            defense.night(turn, set(), commands)
+            attacks = [(key, value) for key, value in commands.items() if value["action"] == "attack"]
+            self.assertEqual(1, len(attacks))
+            self.assertEqual(str(worker.unit_id), attacks[0][1]["controllerId"])
+            self.assertNotIn(worker.unit_id, commands)
+            fired.append(attacks[0][0])
+        self.assertEqual([500, 501, 502], fired)
+
+    def test_cooldown_allows_adjacent_repair(self):
+        worker = replace(self.worker, pos=P.Pos(5, 5), backpack=(P.WALL_FIXER,))
+        wall = replace(self.wall, pos=P.Pos(5, 6), health=650)
+        tower = replace(self.rocket, pos=P.Pos(6, 5), cooldown=2)
+        turn = replace(self.base, round_no=71, is_day=False, ours=(self.station, worker, wall, tower))
+        commands = {}
+        defense.night(turn, set(), commands)
+        self.assertEqual(P.WALL_FIXER, commands[worker.unit_id]["name"])
+
+    def test_two_repairers_do_not_spend_two_kits_on_same_wall(self):
+        first = replace(self.worker, pos=P.Pos(5, 5), backpack=(P.WALL_FIXER,))
+        second = replace(self.sample.workers()[1], pos=P.Pos(6, 5), backpack=(P.WALL_FIXER,))
+        wall = replace(self.wall, pos=P.Pos(5, 6), health=250)
+        turn = replace(self.base, round_no=71, is_day=False, ours=(self.station, first, second, wall))
+        commands, claimed = {}, set()
+        for role in (first, second):
+            economy.move_or_repair_wall(turn, role, claimed, commands, urgent_only=True)
+        self.assertEqual(1, sum(c["action"] == "use" for c in commands.values()))
+
+    def test_repair_does_not_ignore_reachable_wall_for_remote_worse_wall(self):
+        worker = replace(self.worker, pos=P.Pos(5, 5), backpack=(P.WALL_FIXER,))
+        nearby = replace(self.wall, pos=P.Pos(5, 6), health=250)
+        remote = replace(self.wall, unit_id=999, pos=P.Pos(25, 25), health=1)
+        turn = replace(self.base, is_day=False, ours=(self.station, worker, nearby, remote))
+        commands = {}
+        self.assertTrue(economy.move_or_repair_wall(turn, worker, set(), commands, urgent_only=True))
+        self.assertEqual(nearby.pos.dump(), commands[worker.unit_id]["targetPos"][0])
+
+    def test_upgrade_priority_changes_with_station_health(self):
+        turn = replace(self.base, round_no=30, gold=100, ours=(self.station, self.rocket))
+        self.assertEqual(P.WEAPON_UP_V1, economy.shopping_list(turn)[0][0])
+        turn = replace(turn, ours=(replace(self.station, health=640), self.rocket))
+        self.assertEqual(P.STATION_UP_V1, economy.shopping_list(turn)[0][0])
+
+    def test_carried_station_upgrade_can_save_base_at_night(self):
+        station = replace(self.station, health=640)
+        worker = replace(self.worker, pos=P.Pos(9, 24), backpack=(P.STATION_UP_V1,))
+        turn = replace(self.base, round_no=201, is_day=False, ours=(station, worker))
+        with patch.object(brain, "MEMORY", Memory()):
+            commands = {}
+            brain._night_phase(turn, commands)
+        self.assertEqual(P.STATION_UP_V1, commands[worker.unit_id]["name"])
+
+    def test_imminent_threat_beats_distant_same_size_cluster(self):
+        near = P.Robot(1, P.Pos(12, 24), P.SMALL_ROBOT, 40, False, self.base.team_type)
+        far = replace(near, robot_id=2, pos=P.Pos(30, 30))
+        hp = {1: 40, 2: 40}
+        self.assertGreater(defense._rocket_value(self.base, near.pos, [near], hp),
+                           defense._rocket_value(self.base, far.pos, [far], hp))
+
+    def test_reserved_step_is_avoided_during_path_search(self):
+        worker = replace(self.worker, pos=P.Pos(5, 5), backpack=())
+        turn = replace(self.base, ours=(self.station, worker))
+        first = grid.next_step_adjacent(turn, worker, P.Pos(9, 5))
+        alternate = grid.next_step_adjacent(turn, worker, P.Pos(9, 5), reserved={first})
+        self.assertIsNotNone(alternate)
+        self.assertNotEqual(first, alternate)
+
+    def test_partial_answer_submitted_then_completed_without_reusing_wrong_answer(self):
+        role = replace(self.sample.pioneers()[0], pos=P.Pos(13, 14))
+        memory = Memory(task_state="exploring", task_point=P.Pos(14, 14), task_started_round=1,
+                        task_desc="Return count and token", task_steps_tried=3,
+                        task_verified_tool_output=True, pending_prompt_kind="task", pending_prompt_round=4)
+        turn = replace(self.base, round_no=5, ours=(self.station, role), phase_task=memory.task_desc,
+                       llm_resp='FINAL: {"count":6}')
+        commands = {}
+        tasks.pioneer(turn, role, memory, set(), commands, allow_new_task=False)
+        self.assertEqual('{"count":6}', commands[role.unit_id]["taskAnswer"])
+        turn = replace(turn, round_no=6, llm_resp="", errors=(P.GameError(2, "missing token"),))
+        prompt, _ = tasks.pioneer(turn, role, memory, set(), {}, allow_new_task=False)
+        self.assertIn("部分", prompt)
+        self.assertIn("missing token", prompt)
+        turn = replace(turn, round_no=7, errors=(), llm_resp='FINAL: {"count":6,"token":"verified"}')
+        commands = {}
+        tasks.pioneer(turn, role, memory, set(), commands, allow_new_task=False)
+        self.assertEqual("submitAnswer", commands[role.unit_id]["action"])
+        self.assertEqual([], memory.sops)
+
+    def test_departure_deadline_ends_unfinished_task_for_return(self):
+        role = replace(self.sample.pioneers()[0], pos=P.Pos(13, 14))
+        memory = Memory(task_state="exploring", task_point=P.Pos(14, 14), task_started_round=1,
+                        task_desc="query", task_steps_tried=3)
+        turn = replace(self.base, round_no=60, ours=(self.station, role), phase_task="query")
+        commands = {}
+        tasks.pioneer(turn, role, memory, set(), commands, allow_new_task=False, departure_round=60)
+        self.assertEqual("idle", memory.task_state)
+        self.assertEqual({}, commands)
+
+    def test_task_selection_accounts_for_travel_and_return_time(self):
+        role = replace(self.sample.pioneers()[0], pos=P.Pos(9, 24))
+        nearby = replace(self.sample.player_tasks[0], position=P.Pos(7, 24),
+                         timeout_rounds=2, cold_down=0, is_valid=True, score_reward=10)
+        remote = replace(nearby, position=P.Pos(30, 20), score_reward=1000)
+        turn = replace(self.base, round_no=60, ours=(self.station, role), player_tasks=(nearby, remote))
+        self.assertEqual(nearby.position, tasks._pick_task_point(turn, role, Memory()))
+
+
+if __name__ == "__main__":
+    unittest.main()

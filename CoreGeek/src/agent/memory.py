@@ -38,6 +38,14 @@ class Memory:
 
     # 1) 建造区试错学习: (pos, kind) -> 最近一次 build 是否合法
     build_ok: dict[tuple[int, int, str], bool] = field(default_factory=dict)
+    build_retry_after: dict[tuple[int, int, str], int] = field(default_factory=dict)
+    build_failures: dict[tuple[int, int, str], int] = field(default_factory=dict)
+    current_round: int = 0
+    worker_modes: dict[int, str] = field(default_factory=dict)
+    returning_roles: set[int] = field(default_factory=set)
+    gate_pos: Pos | None = None
+    tower_layout: tuple[Pos, ...] = ()
+    task_outcomes: dict[Pos, tuple[int, int]] = field(default_factory=dict)
     # 2) 每日官方新闻存档 {day: text}
     official_news: dict[int, str] = field(default_factory=dict)
     # 3) 每日民间传闻存档 {day: text}
@@ -60,6 +68,7 @@ class Memory:
     # 7) 自进化任务状态机
     task_state: str = "idle"  # idle / accepting / accepted / exploring / answering
     task_started_round: int = 0
+    task_departure_round: int = 0
     task_point: Pos | None = None
     task_desc: str = ""
     task_steps_tried: int = 0
@@ -106,12 +115,25 @@ class Memory:
 
     # ------------------------------------------------------------------
     def note_build_result(self, pos: Pos, kind: str, ok: bool) -> None:
-        if not ok:
-            # 标记非法, 同一位置+类型不再尝试
-            self.build_ok[(pos.x, pos.y, kind)] = False
+        key = (pos.x, pos.y, kind)
+        if ok:
+            self.build_failures.pop(key, None)
+            self.build_retry_after.pop(key, None)
+        else:
+            # 接口只给成功/失败，不能把临时占位或资金不足当成永久非法。
+            failures = self.build_failures.get(key, 0) + 1
+            self.build_failures[key] = failures
+            self.build_retry_after[key] = self.current_round + min(20, 2 ** min(failures, 5))
 
     def build_allowed(self, pos: Pos, kind: str) -> bool:
-        return self.build_ok.get((pos.x, pos.y, kind), True)
+        key = (pos.x, pos.y, kind)
+        return (self.build_ok.get(key, True)
+                and self.current_round >= self.build_retry_after.get(key, 0))
+
+    def record_task_outcome(self, completed: bool) -> None:
+        if self.task_point is not None:
+            wins, attempts = self.task_outcomes.get(self.task_point, (0, 0))
+            self.task_outcomes[self.task_point] = (wins + int(completed), attempts + 1)
 
     # ------------------------------------------------------------------
     def llm_budget_left(self, day: int) -> int:

@@ -9,7 +9,7 @@
 from itertools import combinations, permutations
 from typing import Any
 
-from . import protocol as P
+from . import protocol as P, economy
 from .grid import line_cells, neighbours, next_step_adjacent, next_step_adjacent_to_any
 from .protocol import (
     BOSS_ROBOT,
@@ -38,14 +38,15 @@ def night(
 ) -> None:
     """夜晚主流程: 为每座武器配一名炮手, 选目标开火; 无武器时角色撤回基地。"""
     unavailable_role_ids = unavailable_role_ids or set()
-    pairs = _pair_gunners(turn, unavailable_role_ids)
+    unavailable_role_ids = unavailable_role_ids | set(commands)
+    pairs = _pair_gunners(turn, unavailable_role_ids, ready_only=True)
     remaining_hp = {robot.robot_id: robot.health for robot in turn.robots}
 
     # 按武器类型顺序开火: 火箭(群伤) -> 电磁(穿透) -> 加特林(补刀)
     for tower, gunner in sorted(pairs, key=lambda p: (p[0].cooldown > 0, p[0].kind != ROCKET, p[0].kind != RAILGUN)):
         if distance(gunner.pos, tower.pos) > 1:
             # 炮手不在位: 先归位(每回合一步)
-            step = next_step_adjacent(turn, gunner, tower.pos)
+            step = next_step_adjacent(turn, gunner, tower.pos, reserved=claimed)
             if step is not None and step not in claimed:
                 claimed.add(step)
                 commands[gunner.unit_id] = move_command(step)
@@ -59,18 +60,31 @@ def night(
         _deduct_expected(tower, targets, list(turn.robots), remaining_hp)
         claimed.add(gunner.pos)
 
+    # 只占用真正开火或移动的炮手；冷却空窗可修身边的墙。
+    busy = unavailable_role_ids | set(commands)
+    busy.update(int(command["controllerId"]) for command in commands.values()
+                if command.get("action") == "attack")
+    for role in turn.controllable():
+        if role.unit_id not in busy:
+            if economy.move_or_repair_wall(turn, role, claimed, commands, allow_move=False):
+                busy.add(role.unit_id)
     # 没有配到武器的角色: 撤回基地附近避险
-    _evacuate_idle_roles(turn, pairs, claimed, commands, unavailable_role_ids)
+    _evacuate_idle_roles(turn, pairs, claimed, commands, busy)
 
 
 def _pair_gunners(
     turn: P.Turn,
     unavailable_role_ids: set[int] | None = None,
+    *,
+    ready_only: bool = False,
 ) -> list[tuple[Unit, Unit]]:
     """最多三人三炮，穷举配对以优先保证本回合能开火。"""
     unavailable_role_ids = unavailable_role_ids or set()
     roles = [r for r in turn.controllable() if r.unit_id not in unavailable_role_ids]
-    towers = list(turn.weapons())
+    towers = [tower for tower in turn.weapons() if not ready_only or (
+        tower.cooldown == 0 and any(distance(tower.pos, robot.pos) <= tower.range_of_attack()
+                                   for robot in turn.robots)
+    )]
     n = min(len(roles), len(towers))
     if n == 0:
         return []
@@ -81,8 +95,9 @@ def _pair_gunners(
         for selected_roles in permutations(roles, n):
             pairs = list(zip(selected_towers, selected_roles))
             score = sum(
-                (100 + 5 * priority.get(tower.kind, 0)) if distance(tower.pos, role.pos) <= 1
-                else (2 * priority.get(tower.kind, 0) - 10 * distance(tower.pos, role.pos))
+                ((100 + 5 * priority.get(tower.kind, 0) - 50 * (tower.cooldown > 0)
+                  - 3 * role.has(P.WALL_FIXER)) if distance(tower.pos, role.pos) <= 1
+                 else (2 * priority.get(tower.kind, 0) - 10 * distance(tower.pos, role.pos)))
                 for tower, role in pairs
             )
             if score > best_score:
@@ -106,6 +121,7 @@ def _choose_targets(
         return []
 
     if tower.kind == ROCKET:
+        weights = {robot.robot_id: _threat_weight(turn, robot) for robot in in_range}
         # 导弹允许落点重叠；逐枚选择边际收益最大的格，确保数量始终等于等级。
         candidates = {
             pos
@@ -120,7 +136,8 @@ def _choose_targets(
         for _ in range(max(1, tower.level)):
             best = max(
                 candidates,
-                key=lambda center: _rocket_value(turn, center, in_range, simulated),
+                key=lambda center: (_rocket_value(turn, center, in_range, simulated, weights),
+                                    -center.x, -center.y),
             )
             chosen.append(best)
             _apply_rocket(best, in_range, simulated)
@@ -197,6 +214,7 @@ def _rocket_value(
     center: Pos,
     robots: list[Robot],
     remaining_hp: dict[int, int],
+    weights: dict[int, int] | None = None,
 ) -> int:
     value = 0
     for robot in robots:
@@ -204,9 +222,20 @@ def _rocket_value(
         if hp <= 0 or distance(center, robot.pos) > 1:
             continue
         damage = 20 if robot.pos == center else 10
-        multiplier = 3 if not robot.target_team or robot.target_team == turn.team_type else 1
-        value += min(damage, hp) * multiplier + robot.score
+        multiplier = weights[robot.robot_id] if weights is not None else _threat_weight(turn, robot)
+        value += (min(damage, hp) + (10 if hp <= damage else 0)) * multiplier + robot.score
     return value
+
+
+def _threat_weight(turn: P.Turn, robot: Robot) -> int:
+    targets_us = not robot.target_team or robot.target_team == turn.team_type
+    protected = [role.pos for role in turn.controllable()]
+    station = turn.station()
+    if station:
+        protected.extend(P.station_footprint(station.pos))
+    nearest = min((distance(robot.pos, pos) for pos in protected), default=99)
+    urgency = 12 if nearest <= 3 else 5 if nearest <= 5 else 0
+    return (3 if targets_us else 1) + urgency
 
 
 def _apply_rocket(center: Pos, robots: list[Robot], remaining_hp: dict[int, int]) -> None:
@@ -278,7 +307,9 @@ def _evacuate_idle_roles(
             continue
         if distance(role.pos, shelter) <= 1:
             continue
-        step = next_step_adjacent_to_any(turn, role, list(footprint))
+        if any(distance(role.pos, tower.pos) <= 1 for tower in turn.weapons()):
+            continue
+        step = next_step_adjacent_to_any(turn, role, list(footprint), reserved=claimed)
         if step is not None and step not in claimed:
             claimed.add(step)
             commands[role.unit_id] = move_command(step)

@@ -11,7 +11,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from agent import brain, defense, economy  # noqa: E402
 from agent.memory import Memory  # noqa: E402
-from agent.protocol import Pos, STATION_UP_V1, Turn, WALL_FIXER  # noqa: E402
+from agent.protocol import Pos, Robot, STATION_UP_V1, Turn, WALL_FIXER  # noqa: E402
 
 
 class DefenseEconomyTests(unittest.TestCase):
@@ -28,6 +28,7 @@ class DefenseEconomyTests(unittest.TestCase):
         with patch.object(brain, "MEMORY", Memory()):
             plan = brain._build_plan(turn)
         self.assertEqual(3, len(plan.tower_sites))
+        self.assertEqual(("rocket", "rocket", "rocket"), plan.tower_kinds)
         self.assertEqual(19, len(plan.wall_sites))
         inside_worker = replace(self.worker, pos=Pos(9, 24))
         turn = replace(turn, round_no=65, ours=(self.station, inside_worker))
@@ -138,6 +139,109 @@ class DefenseEconomyTests(unittest.TestCase):
         commands = {}
         economy.worker_day(turn, worker, plan, set(), set(), Memory(), commands)
         self.assertIn(commands[worker.unit_id]["action"], {"move", "build"})
+
+    def test_income_worker_chooses_copper_instead_of_near_stone(self) -> None:
+        worker = replace(self.worker, pos=Pos(5, 22), backpack=())
+        turn = replace(
+            self.turn, round_no=2, is_day=True, gold=0,
+            zones={Pos(5, 23): "stone", Pos(6, 22): "copper"},
+            ours=(self.station, worker),
+        )
+        commands: dict = {}
+        economy.worker_day(
+            turn, worker, economy.Plan(), set(), set(), Memory(), commands,
+            income_only=True,
+        )
+        self.assertEqual("collect", commands[worker.unit_id]["action"])
+        self.assertEqual({"x": 6, "y": 22}, commands[worker.unit_id]["targetPos"][0])
+
+    def test_income_worker_sells_copper_batch(self) -> None:
+        vendor = self.turn.vendor_pos()
+        self.assertIsNotNone(vendor)
+        worker = replace(
+            self.worker, pos=Pos(vendor.x + 1, vendor.y), backpack=("copper",) * 8,
+        )
+        turn = replace(
+            self.turn, round_no=30, is_day=True, ours=(self.station, worker),
+        )
+        commands: dict = {}
+        economy.worker_day(
+            turn, worker, economy.Plan(), set(), set(), Memory(), commands,
+            income_only=True,
+        )
+        self.assertEqual("sell", commands[worker.unit_id]["action"])
+
+    def test_saves_gold_for_station_instead_of_wall_voucher(self) -> None:
+        turn = replace(
+            self.turn, round_no=30, is_day=True, gold=80,
+            ours=(self.station, self.wall, self.worker),
+        )
+        self.assertEqual([], economy.shopping_list(turn))
+
+    def test_pre_night_gunners_do_not_choose_same_step(self) -> None:
+        tower_positions = (Pos(9, 25), Pos(9, 23), Pos(9, 24))
+        towers = tuple(replace(tower, pos=pos) for tower, pos in
+                       zip(self.turn.weapons(), tower_positions))
+        first = replace(self.turn.workers()[0], pos=Pos(12, 25), backpack=())
+        second = replace(self.turn.workers()[1], pos=Pos(12, 22), backpack=())
+        turn = replace(
+            self.turn, round_no=66, is_day=True, gold=0, zones={},
+            ours=(self.station, *towers, first, second), player_tasks=(), phase_task="",
+        )
+        with patch.object(brain, "MEMORY", Memory()):
+            commands: dict = {}
+            brain._day_phase(turn, commands)
+        destinations = [
+            tuple(command["targetPos"][0].values())
+            for command in commands.values() if command["action"] == "move"
+        ]
+        self.assertEqual(len(destinations), len(set(destinations)))
+        self.assertTrue(destinations)
+
+    def test_idle_pioneer_stages_as_third_gunner(self) -> None:
+        towers = tuple(replace(tower, pos=pos) for tower, pos in zip(
+            self.turn.weapons(), (Pos(9, 25), Pos(9, 23), Pos(9, 24)),
+        ))
+        workers = (
+            replace(self.turn.workers()[0], pos=Pos(12, 25), backpack=()),
+            replace(self.turn.workers()[1], pos=Pos(12, 22), backpack=()),
+        )
+        pioneer = replace(self.turn.pioneers()[0], pos=Pos(12, 27))
+        turn = replace(
+            self.turn, round_no=66, is_day=True, gold=0, zones={},
+            ours=(self.station, *towers, *workers, pioneer),
+            player_tasks=(), phase_task="",
+        )
+        with patch.object(brain, "MEMORY", Memory()):
+            commands: dict = {}
+            brain._day_phase(turn, commands)
+        self.assertEqual("move", commands[pioneer.unit_id]["action"])
+        destinations = [
+            tuple(command["targetPos"][0].values()) for command in commands.values()
+            if command["action"] == "move"
+        ]
+        self.assertEqual(3, len(destinations))
+        self.assertEqual(3, len(set(destinations)))
+
+    def test_no_new_task_is_started_during_night_staging(self) -> None:
+        pioneer = self.turn.pioneers()[0]
+        turn = replace(
+            self.turn, round_no=66, is_day=True, gold=0, zones={},
+            ours=(self.station, pioneer), phase_task="",
+        )
+        with patch.object(brain, "MEMORY", Memory()), patch.object(
+            brain.tasks, "pioneer", return_value=("", ""),
+        ) as task_agent:
+            brain._day_phase(turn, {})
+        self.assertFalse(task_agent.call_args.kwargs["allow_new_task"])
+
+    def test_gatling_ray_hits_front_robot_not_aimed_robot(self) -> None:
+        tower = replace(self.turn.weapons()[0], pos=Pos(10, 10))
+        front = Robot(1, Pos(11, 10), "smallRobot", 20, False, "")
+        rear = Robot(2, Pos(12, 10), "smallRobot", 20, False, "")
+        remaining = {1: 20, 2: 20}
+        defense._deduct_expected(tower, [rear.pos], [front, rear], remaining)
+        self.assertEqual({1: 10, 2: 20}, remaining)
 
     def test_carried_repair_kit_is_used_without_gold_by_day_and_night(self) -> None:
         wall = replace(self.wall, pos=Pos(8, 22), health=300)

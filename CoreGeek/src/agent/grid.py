@@ -16,16 +16,23 @@ def next_step(turn: Turn, moving: Unit, goal: Pos) -> Pos | None:
     return next_step_to_any(turn, moving, (goal,))
 
 
-def next_step_adjacent(turn: Turn, moving: Unit, target: Pos) -> Pos | None:
+def next_step_adjacent(turn: Turn, moving: Unit, target: Pos, *, reserved: set[Pos] | None = None) -> Pos | None:
     """走向交互目标周围一格，而不是尝试走进矿点/商店/建筑本身。"""
-    return next_step_adjacent_to_any(turn, moving, (target,))
+    return next_step_adjacent_to_any(turn, moving, (target,), reserved=reserved)
 
 
 def next_step_adjacent_to_any(
     turn: Turn,
     moving: Unit,
     targets: tuple[Pos, ...] | list[Pos],
+    *,
+    reserved: set[Pos] | None = None,
 ) -> Pos | None:
+    stands = adjacent_stands(turn, moving, targets)
+    return next_step_to_any(turn, moving, stands, reserved=reserved)
+
+
+def adjacent_stands(turn: Turn, moving: Unit, targets) -> set[Pos]:
     blocked = turn.blocked(moving)
     stands = {
         Pos(target.x + dx, target.y + dy)
@@ -37,23 +44,33 @@ def next_step_adjacent_to_any(
         for pos in stands
         if turn.land(pos) and (pos == moving.pos or pos not in blocked)
     }
-    return next_step_to_any(turn, moving, stands)
+    return stands
 
 
 def next_step_to_any(
     turn: Turn,
     moving: Unit,
     goals: tuple[Pos, ...] | list[Pos] | set[Pos],
+    *,
+    reserved: set[Pos] | None = None,
 ) -> Pos | None:
     """返回到一组可站立终点中最近一个的下一步。"""
+    path = path_to_any(turn, moving, goals, reserved=reserved)
+    return path[0] if path else None
+
+
+def path_to_any(turn: Turn, moving: Unit, goals, *, reserved: set[Pos] | None = None) -> list[Pos] | None:
+    """完整路线用于返城预算；空列表表示已经到达，None 表示暂时不可达。"""
     goals = {
         goal
         for goal in goals
         if turn.land(goal)
     }
-    if not goals or moving.pos in goals:
+    if not goals:
         return None
-    blocked = turn.blocked(moving)
+    if moving.pos in goals:
+        return []
+    blocked = turn.blocked(moving) | (reserved or set())
     goals = {goal for goal in goals if goal == moving.pos or goal not in blocked}
     if not goals:
         return None
@@ -74,7 +91,11 @@ def next_step_to_any(
         if current in seen:
             continue
         if current in goals:
-            return _first_step(came_from, moving.pos, current)
+            path = []
+            while current != moving.pos:
+                path.append(current)
+                current = came_from[current]
+            return list(reversed(path))
         seen.add(current)
         for dx, dy in STEPS:
             step = Pos(current.x + dx, current.y + dy)

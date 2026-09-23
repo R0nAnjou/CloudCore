@@ -245,6 +245,7 @@ class Turn:
     vendor_prices: dict[str, int]
     shop_prices: dict[str, int]
     errors: tuple[GameError, ...]
+    total_score: int = 0
 
     @classmethod
     def load(cls, payload: dict[str, Any]) -> "Turn":
@@ -292,6 +293,7 @@ class Turn:
                 for v in payload.get("weaponShopList") or ()
             },
             errors=tuple(GameError.load(v) for v in payload.get("errors") or ()),
+            total_score=int(team.get("totalScore") or 0),
         )
 
     # ---- 单位查询 ------------------------------------------------------

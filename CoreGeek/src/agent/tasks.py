@@ -3,10 +3,11 @@ import json
 import logging
 import re
 import shlex
+from dataclasses import replace
 from typing import Any
 
 from . import protocol as P
-from .grid import next_step_adjacent
+from .grid import adjacent_stands, path_to_any, next_step_adjacent
 from .memory import Memory, SopRecord
 from .protocol import (
     Pos,
@@ -46,8 +47,11 @@ def pioneer(
     commands: dict[int, dict[str, Any]],
     *,
     allow_new_task: bool = True,
+    allow_treasure: bool = True,
+    departure_round: int = 0,
 ) -> tuple[str, str]:
     """开拓者状态机，返回本回合的 (prompt, executeCmd)。"""
+    memory.task_departure_round = departure_round
     if turn.llm_resp:
         _consume_llm_resp(turn, memory, turn.llm_resp)
     elif memory.pending_prompt_round and turn.round_no - memory.pending_prompt_round > 2:
@@ -57,18 +61,32 @@ def pioneer(
 
     _sync_task_state(turn, pioneer_role, memory)
 
+    if departure_round and turn.round_no >= departure_round:
+        if (memory.task_state in ACTIVE_TASK_STATES and memory.task_answer
+                and memory.task_state != "answering" and memory.task_point is not None
+                and distance(pioneer_role.pos, memory.task_point) <= 1):
+            commands[pioneer_role.unit_id] = submit_answer_command(memory.task_answer)
+            memory.task_state = "answering"
+            memory.task_answered_round = turn.round_no
+        elif memory.task_state in ACTIVE_TASK_STATES:
+            memory.record_task_outcome(False)
+            LOGGER.info("task return deadline reached; return to defense")
+            memory.reset_task()
+        return "", ""
+
     if memory.task_state in ACTIVE_TASK_STATES:
         return _task_pipeline(turn, pioneer_role, memory, commands)
 
-    handled, prompt = _treasure_action(turn, pioneer_role, memory, claimed, commands)
+    handled, prompt = (_treasure_action(turn, pioneer_role, memory, claimed, commands)
+                       if allow_treasure else (False, ""))
     if handled:
         return prompt, ""
 
     # prompt 与角色动作可同回合提交，不因赶往任务点而饿死宝藏推理链路。
-    inference_prompt = _maybe_request_treasure_inference(turn, memory)
+    inference_prompt = _maybe_request_treasure_inference(turn, memory) if allow_treasure else ""
 
     if allow_new_task and turn.is_day:
-        target = _pick_task_point(turn)
+        target = _pick_task_point(turn, pioneer_role, memory)
         if target is not None:
             if distance(pioneer_role.pos, target) <= 1:
                 commands[pioneer_role.unit_id] = accept_task_command()
@@ -77,7 +95,7 @@ def pioneer(
                 memory.task_point = target
                 LOGGER.info("requesting task at %s", target)
                 return inference_prompt, ""
-            step = next_step_adjacent(turn, pioneer_role, target)
+            step = next_step_adjacent(turn, pioneer_role, target, reserved=claimed)
             if step is not None and step not in claimed:
                 claimed.add(step)
                 commands[pioneer_role.unit_id] = move_command(step)
@@ -90,6 +108,8 @@ def _sync_task_state(turn: P.Turn, role: Unit, memory: Memory) -> None:
     error_codes = {error.code for error in turn.errors}
     if 1 in error_codes:
         LOGGER.info("task timed out")
+        if memory.task_state in ACTIVE_TASK_STATES:
+            memory.record_task_outcome(False)
         memory.reset_task()
         return
     if 2 in error_codes and memory.task_state == "answering":
@@ -110,6 +130,7 @@ def _sync_task_state(turn: P.Turn, role: Unit, memory: Memory) -> None:
         # 只有提交后任务实际结束、且没有失败反馈，才将答案视为可复用经验。
         memory.add_sop(memory.task_desc, _extract_steps(memory), memory.task_answer[:2000])
         LOGGER.info("task completed after answer submission")
+        memory.record_task_outcome(True)
         memory.reset_task()
         return
 
@@ -156,14 +177,36 @@ def _reject_task_answer(memory: Memory, reason: str) -> None:
     memory.pending_prompt_kind = ""
 
 
-def _pick_task_point(turn: P.Turn) -> Pos | None:
+def _pick_task_point(turn: P.Turn, role: Unit | None = None, memory: Memory | None = None) -> Pos | None:
     ready = [task for task in turn.player_tasks if task.is_valid and task.cold_down == 0]
     if not ready:
         return None
-    return max(
-        ready,
-        key=lambda task: (task.score_reward + task.gold_reward, task.timeout_rounds),
-    ).position
+    role = role or next(iter(turn.pioneers()), None)
+    if role is None:
+        return None
+    scored = []
+    for task in ready:
+        path = path_to_any(turn, role, adjacent_stands(turn, role, (task.position,)))
+        if path is None:
+            continue
+        travel = len(path)
+        station = turn.station()
+        return_steps = 0
+        if station:
+            arrived = replace(role, pos=path[-1] if path else role.pos)
+            back = path_to_any(turn, arrived, adjacent_stands(turn, arrived, P.station_footprint(station.pos)))
+            if back is None:
+                continue
+            return_steps = len(back)
+        duration = task.timeout_rounds or 12
+        daylight = 70 - ((turn.round_no - 1) % P.ROUNDS_PER_DAY + 1)
+        if travel + duration + return_steps + 3 > daylight:
+            continue
+        wins, attempts = memory.task_outcomes.get(task.position, (0, 0)) if memory else (0, 0)
+        probability = (wins + 1) / (attempts + 2)
+        value = probability * (task.score_reward + task.gold_reward) / max(1, travel + duration)
+        scored.append((value, task.position))
+    return max(scored, key=lambda item: item[0])[1] if scored else None
 
 
 def _task_pipeline(
@@ -267,9 +310,12 @@ def _successful_query_result(result: str) -> bool:
 
 def _task_rounds_left(turn: P.Turn, memory: Memory) -> int | None:
     task = next((item for item in turn.player_tasks if item.position == memory.task_point), None)
-    if task is None or task.timeout_rounds <= 0:
-        return None
-    return max(0, task.timeout_rounds - (turn.round_no - memory.task_started_round))
+    limits = []
+    if task is not None and task.timeout_rounds > 0:
+        limits.append(task.timeout_rounds - (turn.round_no - memory.task_started_round))
+    if memory.task_departure_round:
+        limits.append(memory.task_departure_round - turn.round_no)
+    return max(0, min(limits)) if limits else None
 
 
 def _tool_calls_left(turn: P.Turn, memory: Memory, *, responding: bool = False) -> int:
@@ -334,17 +380,19 @@ def _request_task_llm(
         prior += f"\n--- 已被判错误或未完成的答案（禁止原样重复） ---\n{rejected}\n"
     available_calls = _tool_calls_left(turn, memory)
     if available_calls == 0:
-        next_action = "剩余回合不足以继续查询；请尽快给出最有根据的 FINAL，不要使用占位值。"
+        next_action = "剩余回合不足以继续查询；立即 FINAL 提交已核实字段以争取部分分，缺少证据的字段省略，禁止猜测。"
     elif not memory.task_verified_tool_output:
         next_action = "尚未取得成功的题目查询结果，本次必须先给出一条沙盒查询命令。"
     else:
-        next_action = "若证据不足可继续查询；只有真实结果足以确定全部字段时才给 FINAL。"
+        next_action = "优先 FINAL 提交已经核实的字段保底得分，再根据判题反馈查询和补齐缺失字段。不要等所有字段齐全才首次提交。"
     return (
         "你是游戏内任务求解器。沙盒可执行基础 shell/Python 命令且无外网。"
         "先依据任务文档实际查询 API、数据文件或计算 token；不能猜测数值，也不能用 unknown/placeholder 充数。"
-        "每次只返回一行，二选一：CMD: <一条只读 shell 命令> 或 FINAL: <完整提交答案>。"
+        "每次只返回一行，二选一：CMD: <一条只读 shell 命令> 或 FINAL: <提交答案>。"
+        "规则按正确字段给部分积分和金币；FINAL 可为包含已核实字段的部分答案，保持题目规定的结构。"
         "不要解释、不要 Markdown 围栏。CMD 会由 executeCmd 执行，结果在下一次消息中给你。"
-        "命令不要修改/删除文件、不要访问外网、不要用管道或分号；"
+        "命令不要修改/删除文件、不要访问外网、不要用分号或重定向；"
+        "可用至多两段只读命令通过 | 连接，例如 curl ... | jq ...。"
         "URL 含 & 时须用引号包住。复杂计算可用 python3 -c；哈希可用 sha256sum 等工具。"
         f"{next_action}最多还能执行 {available_calls} 条自选命令。\n"
         f"--- 当前任务 ---\n{desc}\n"
@@ -384,7 +432,7 @@ def _parse_task_llm_output(resp: str) -> tuple[str, str]:
 
 
 def _safe_task_command(command: str) -> bool:
-    """限制 LLM 只能给沙盒发送单条查询/计算命令。"""
+    """只允许最多两段只读查询管道，禁止连接符与重定向。"""
     if (not command or len(command) > 2000 or "\n" in command or "\r" in command
             or "$(" in command or "`" in command):
         return False
@@ -395,9 +443,21 @@ def _safe_task_command(command: str) -> bool:
         tokens = list(lexer)
     except ValueError:
         return False
-    if not tokens or tokens[0].lower() not in ALLOWED_TASK_TOOLS:
+    if not tokens or any(token in {";", "&", "&&", "||", ">", ">>", "<", "<<", "`"}
+                         for token in tokens):
         return False
-    return not any(re.fullmatch(r"[;&|<>`]+", token) for token in tokens)
+    segments: list[list[str]] = [[]]
+    for token in tokens:
+        if token == "|":
+            segments.append([])
+        elif re.fullmatch(r"[;&|<>`]+", token):
+            return False
+        else:
+            segments[-1].append(token)
+    return (len(segments) <= 2 and all(
+        segment and segment[0].lower() in ALLOWED_TASK_TOOLS
+        for segment in segments
+    ))
 
 
 def _answer_has_placeholder(answer: str) -> bool:
@@ -435,13 +495,16 @@ def _consume_llm_resp(turn: P.Turn, memory: Memory, resp: str) -> None:
                 memory.task_next_command = value
                 LOGGER.info("LLM requested task sandbox command (%d chars)", len(value))
             else:
-                memory.task_transcript.append("命令格式不安全或不受支持；请使用单条只读查询命令。")
-                LOGGER.warning("LLM requested unsupported task command")
+                memory.task_transcript.append(
+                    "命令格式不安全或不受支持；请使用允许的只读工具，最多两段管道，"
+                    "不要使用分号、重定向或外网。"
+                )
+                LOGGER.warning("LLM requested unsupported task command (tool=%r, len=%d)",
+                               value.split(maxsplit=1)[0] if value else "", len(value))
         elif not value or value in memory.task_rejected_answers or _answer_has_placeholder(value):
             memory.task_transcript.append("答案为空、包含占位值或此前已被判错；请继续查询证据。")
             LOGGER.warning("LLM returned empty, placeholder, or previously rejected task answer")
-        elif not memory.task_verified_tool_output and (_task_rounds_left(turn, memory) is None
-                or _task_rounds_left(turn, memory) > 2):
+        elif not memory.task_verified_tool_output:
             memory.task_transcript.append("尚未取得成功的题目查询结果；请先给出 CMD，不要猜最终答案。")
             LOGGER.warning("LLM attempted task answer before querying sandbox")
         else:
@@ -527,24 +590,28 @@ def _treasure_action(
     if missing is not None:
         shop = turn.weapon_shop_pos()
         price = turn.shop_prices.get(missing, 0)
+        station = turn.station()
+        reserve = (100 if station.level == 1 else 150) if (
+            station and station.level < 3 and station.health < 1500 * station.level * 0.65
+        ) else 20
         if (
             shop is None
             or price <= 0
-            or turn.gold - _reserved_gold(turn, commands) < price
+            or turn.gold - _reserved_gold(turn, commands) - reserve < price
             or role.backpack_full
         ):
-            return True, ""
+            return False, ""  # 买不起宝藏用品时继续做能挣钱的任务。
         if distance(role.pos, shop) <= 1:
             commands[role.unit_id] = buy_command(missing, 1)
         else:
-            step = next_step_adjacent(turn, role, shop)
+            step = next_step_adjacent(turn, role, shop, reserved=claimed)
             if step is not None and step not in claimed:
                 claimed.add(step)
                 commands[role.unit_id] = move_command(step)
         return True, ""
 
     if distance(role.pos, pos) > 1:
-        step = next_step_adjacent(turn, role, pos)
+        step = next_step_adjacent(turn, role, pos, reserved=claimed)
         if step is not None and step not in claimed:
             claimed.add(step)
             commands[role.unit_id] = move_command(step)
