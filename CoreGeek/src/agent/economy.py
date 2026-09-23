@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from . import protocol as P
-from .grid import next_step_adjacent, next_step_adjacent_to_any
+from .grid import neighbours, next_step_adjacent, next_step_adjacent_to_any
 from .memory import Memory
 from .protocol import (
     COPPER,
@@ -43,6 +43,7 @@ WALL_STONE_KEEP = 2  # 工人背包中常备的墙材料石头数
 STONE_BUILD_BATCH = 5  # 避免每采一块石头就长途往返基地
 HEALTHY_WALL_RATIO = 0.8  # 白天尽早修墙，避免残血墙进入夜晚
 SELL_BATCH = 8
+NIGHT_ROBOT_CLEARANCE = 6
 
 
 @dataclass
@@ -128,13 +129,46 @@ def worker_night_safe(
     claimed: set[Pos],
     commands: dict[int, dict[str, Any]],
 ) -> bool:
-    """机器人清空后的夜间安全采矿/卖矿；绝不建造或离开敌方占格的寻路规则。"""
+    """B 工夜间持续采矿；机器人接近时先撤离，绝不为一块矿冒险。"""
+    def clearance(pos: Pos) -> int:
+        return min((distance(pos, robot.pos) for robot in turn.robots), default=99)
+
+    def retreat() -> bool:
+        blocked = turn.blocked(worker)
+        candidates = [
+            pos for pos in neighbours(worker.pos)
+            if turn.land(pos) and pos not in blocked and pos not in claimed
+        ]
+        if not candidates:
+            return False
+        step = max(candidates, key=lambda pos: (clearance(pos), -distance(pos, worker.pos), -pos.x, -pos.y))
+        if clearance(step) <= clearance(worker.pos):
+            return False
+        claimed.add(step)
+        commands[worker.unit_id] = move_command(step)
+        return True
+
+    if turn.robots and clearance(worker.pos) < NIGHT_ROBOT_CLEARANCE:
+        return retreat()
+
     day = P.day_index(turn.round_no)
-    if _try_sell(turn, worker, day, memory, claimed, commands):
-        return True
-    if not worker.backpack_full and _try_collect_income(turn, worker, day, memory, claimed, commands):
-        return True
-    return False
+    trial_claimed = set(claimed)
+    trial_commands: dict[int, dict[str, Any]] = {}
+    acted = _try_sell(turn, worker, day, memory, trial_claimed, trial_commands)
+    if not acted and not worker.backpack_full:
+        acted = _try_collect_income(
+            turn, worker, day, memory, trial_claimed, trial_commands,
+        )
+    command = trial_commands.get(worker.unit_id)
+    if not acted or command is None:
+        return False
+    target = Pos.load(command["targetPos"][0])
+    exposed = target if command["action"] == "move" else worker.pos
+    if turn.robots and clearance(exposed) < NIGHT_ROBOT_CLEARANCE:
+        return retreat()
+    claimed.update(trial_claimed)
+    commands[worker.unit_id] = command
+    return True
 
 
 def _try_build(

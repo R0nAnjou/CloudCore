@@ -83,13 +83,18 @@ class SurvivalLoopTests(unittest.TestCase):
         with patch.object(brain, "MEMORY", Memory()):
             plan = brain._build_plan(self.base)
             gate = brain._gate_position(self.base)
-            inner = brain._ring(P.station_footprint(self.station.pos), 2)
-            doorway = next(pos for pos in inner if P.distance(pos, gate) <= 1)
+            inner = brain._ring(P.station_footprint(self.station.pos), 1)
+            doorway = next(
+                pos for pos in inner
+                if P.distance(pos, gate) <= 1
+                and pos != brain.MEMORY.gunner_pos
+                and pos not in plan.tower_sites
+            )
             worker = replace(self.worker, pos=doorway, backpack=(P.STONE,) * 3)
             footprint = P.station_footprint(self.station.pos)
             outside = next(
                 pos for pos in grid.neighbours(gate)
-                if min(P.distance(pos, cell) for cell in footprint) > 3
+                if min(P.distance(pos, cell) for cell in footprint) > 2
             )
             pioneer = replace(self.sample.pioneers()[0], pos=outside, backpack=())
             walls = tuple(replace(self.wall, unit_id=40000+i, pos=pos, health=1000)
@@ -166,6 +171,43 @@ class SurvivalLoopTests(unittest.TestCase):
             self.assertTrue(all(P.distance(shared, tower) <= 1 for tower in plan.tower_sites))
             self.assertNotIn(shared, plan.tower_sites)
 
+    def test_gate_waits_until_pioneer_reaches_shared_gunner_cell(self):
+        with patch.object(brain, "MEMORY", Memory()):
+            plan = brain._build_plan(self.base)
+            gate = brain._gate_position(self.base)
+            shared = brain.MEMORY.gunner_pos
+            towers = tuple(
+                replace(self.rocket, unit_id=500 + index, pos=pos)
+                for index, pos in enumerate(plan.tower_sites)
+            )
+            walls = tuple(
+                replace(self.wall, unit_id=40000 + index, pos=pos, health=1000)
+                for index, pos in enumerate(plan.wall_sites)
+            )
+            defender = replace(self.worker, pos=next(
+                pos for pos in brain._ring(P.station_footprint(self.station.pos), 1)
+                if pos not in plan.tower_sites and pos != shared
+            ), backpack=(P.STONE,))
+            pioneer = replace(self.sample.pioneers()[0], pos=defender.pos, backpack=())
+            waiting = replace(
+                self.base, round_no=65,
+                ours=(self.station, defender, pioneer, *towers, *walls),
+            )
+            self.assertNotIn(gate, brain._build_plan(waiting).wall_sites)
+            ready = replace(waiting, ours=(
+                self.station, defender, replace(pioneer, pos=shared), *towers, *walls,
+            ))
+            self.assertIn(gate, brain._build_plan(ready).wall_sites)
+
+    def test_build_plan_never_leaves_documented_colored_rings(self):
+        with patch.object(brain, "MEMORY", Memory()):
+            plan = brain._build_plan(self.base)
+            footprint = P.station_footprint(self.station.pos)
+            self.assertTrue(set(plan.tower_sites) <= set(brain._ring(footprint, 1)))
+            self.assertTrue(set(plan.wall_sites) <= set(brain._ring(footprint, 2)))
+            self.assertEqual(3, len(plan.tower_sites))
+            self.assertEqual(19, len(plan.wall_sites))
+
     def test_post_wave_rocket_attacks_enemy_wall(self):
         pioneer = replace(self.sample.pioneers()[0], pos=P.Pos(5, 5), backpack=())
         rocket = replace(self.rocket, pos=P.Pos(4, 5), level=2, attack_range=15)
@@ -197,7 +239,39 @@ class SurvivalLoopTests(unittest.TestCase):
         attacks = [command for command in commands.values() if command["action"] == "attack"]
         self.assertEqual(1, len(attacks))
         self.assertEqual(str(pioneer.unit_id), attacks[0]["controllerId"])
-        self.assertTrue(all(worker.unit_id not in commands for worker in workers))
+        self.assertNotIn(workers[0].unit_id, commands)
+        self.assertEqual("move", commands[workers[1].unit_id]["action"])
+        old_clearance = min(P.distance(workers[1].pos, item.pos) for item in turn.robots)
+        new_pos = P.Pos.load(commands[workers[1].unit_id]["targetPos"][0])
+        new_clearance = min(P.distance(new_pos, item.pos) for item in turn.robots)
+        self.assertGreater(new_clearance, old_clearance)
+
+    def test_safe_night_miner_keeps_collecting_while_robots_exist(self):
+        worker = replace(self.worker, pos=P.Pos(5, 22), backpack=())
+        mine = P.Pos(6, 22)
+        robot = P.Robot(1, P.Pos(20, 20), P.SMALL_ROBOT, 20, False, self.base.team_type)
+        turn = replace(
+            self.base, round_no=71, is_day=False, ours=(self.station, worker),
+            zones={mine: P.COPPER}, robots=(robot,), vendor_prices={P.COPPER: 10},
+        )
+        commands = {}
+        acted = economy.worker_night_safe(turn, worker, Memory(), set(), commands)
+        self.assertTrue(acted)
+        self.assertEqual("collect", commands[worker.unit_id]["action"])
+
+    def test_threatened_night_miner_retreats_instead_of_collecting(self):
+        worker = replace(self.worker, pos=P.Pos(10, 10), backpack=())
+        mine = P.Pos(11, 10)
+        robot = P.Robot(1, P.Pos(8, 8), P.SMALL_ROBOT, 20, False, self.base.team_type)
+        turn = replace(
+            self.base, round_no=71, is_day=False, ours=(self.station, worker),
+            zones={mine: P.COPPER}, robots=(robot,), vendor_prices={P.COPPER: 10},
+        )
+        commands = {}
+        economy.worker_night_safe(turn, worker, Memory(), set(), commands)
+        self.assertEqual("move", commands[worker.unit_id]["action"])
+        step = P.Pos.load(commands[worker.unit_id]["targetPos"][0])
+        self.assertGreater(P.distance(step, robot.pos), P.distance(worker.pos, robot.pos))
 
     def test_one_role_rotates_three_rockets_by_reported_cooldown(self):
         worker = replace(self.worker, pos=P.Pos(5, 5), backpack=())
