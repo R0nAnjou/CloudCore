@@ -210,7 +210,7 @@ class DefenseEconomyTests(unittest.TestCase):
         self.assertEqual(len(destinations), len(set(destinations)))
         self.assertTrue(destinations)
 
-    def test_idle_pioneer_stages_as_third_gunner(self) -> None:
+    def test_incomplete_wall_line_keeps_b_inside_while_pioneer_stages(self) -> None:
         towers = tuple(replace(tower, pos=pos) for tower, pos in zip(
             self.turn.weapons(), (Pos(9, 25), Pos(9, 23), Pos(9, 24)),
         ))
@@ -227,14 +227,32 @@ class DefenseEconomyTests(unittest.TestCase):
         with patch.object(brain, "MEMORY", Memory()):
             commands: dict = {}
             brain._day_phase(turn, commands)
+            returning_roles = set(brain.MEMORY.returning_roles)
         self.assertEqual("move", commands[pioneer.unit_id]["action"])
         destinations = [
             tuple(command["targetPos"][0].values()) for command in commands.values()
             if command["action"] == "move"
         ]
-        self.assertEqual(3, len(destinations))
-        self.assertEqual(3, len(set(destinations)))
-        self.assertNotIn(workers[-1].unit_id, brain.MEMORY.returning_roles)
+        self.assertEqual(len(destinations), len(set(destinations)))
+        self.assertIn(workers[-1].unit_id, returning_roles)
+
+    def test_emergency_station_upgrade_bypasses_wall_quota(self) -> None:
+        shop = Pos(6, 5)
+        station = replace(self.station, health=600)
+        workers = (
+            replace(self.turn.workers()[0], pos=Pos(5, 5), backpack=()),
+            replace(self.turn.workers()[1], pos=Pos(8, 8), backpack=()),
+        )
+        turn = replace(
+            self.turn, round_no=30, is_day=True, gold=100,
+            zones={shop: "weaponShop"}, ours=(station, *workers),
+            player_tasks=(), phase_task="",
+        )
+        with patch.object(brain, "MEMORY", Memory()):
+            commands: dict = {}
+            brain._day_phase(turn, commands)
+        self.assertEqual("buy", commands[workers[0].unit_id]["action"])
+        self.assertEqual(STATION_UP_V1, commands[workers[0].unit_id]["name"])
 
     def test_no_new_task_is_started_during_night_staging(self) -> None:
         pioneer = self.turn.pioneers()[0]

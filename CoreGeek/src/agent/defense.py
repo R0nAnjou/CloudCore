@@ -41,8 +41,11 @@ def night(
     """夜晚主流程: 为每座武器配一名炮手, 选目标开火; 无武器时角色撤回基地。"""
     unavailable_role_ids = unavailable_role_ids or set()
     unavailable_role_ids = unavailable_role_ids | set(commands)
-    pairs = _pair_gunners(turn, unavailable_role_ids, ready_only=True)
-    remaining_hp = {robot.robot_id: robot.health for robot in turn.robots}
+    defensive_robots = list(robots_threatening_us(turn))
+    pairs = _pair_gunners(
+        turn, unavailable_role_ids, ready_only=True, robots=defensive_robots,
+    )
+    remaining_hp = {robot.robot_id: robot.health for robot in defensive_robots}
 
     # 按武器类型顺序开火: 火箭(群伤) -> 电磁(穿透) -> 加特林(补刀)
     for tower, gunner in sorted(pairs, key=lambda p: (p[0].cooldown > 0, p[0].kind != ROCKET, p[0].kind != RAILGUN)):
@@ -55,15 +58,17 @@ def night(
             continue
         if tower.cooldown > 0:
             continue
-        targets = _choose_targets(turn, tower, list(turn.robots), remaining_hp)
+        targets = _choose_targets(turn, tower, defensive_robots, remaining_hp)
         if not targets:
             continue
         commands[tower.unit_id] = attack_command(gunner.unit_id, targets)
-        _deduct_expected(tower, targets, list(turn.robots), remaining_hp)
+        _deduct_expected(tower, targets, defensive_robots, remaining_hp)
         claimed.add(gunner.pos)
 
     # 本方机器人浪潮已清空后，空闲火箭继续轰击射程内敌方城墙。
-    if not turn.robots and not any(command.get("action") == "attack" for command in commands.values()):
+    if not defensive_robots and not any(
+        command.get("action") == "attack" for command in commands.values()
+    ):
         counter = _post_wave_wall_attack(turn, unavailable_role_ids | set(commands))
         if counter is not None:
             tower, gunner, targets = counter
@@ -125,13 +130,15 @@ def _pair_gunners(
     unavailable_role_ids: set[int] | None = None,
     *,
     ready_only: bool = False,
+    robots: list[Robot] | tuple[Robot, ...] | None = None,
 ) -> list[tuple[Unit, Unit]]:
     """最多三人三炮，穷举配对以优先保证本回合能开火。"""
     unavailable_role_ids = unavailable_role_ids or set()
     roles = [r for r in turn.controllable() if r.unit_id not in unavailable_role_ids]
+    target_robots = turn.robots if robots is None else robots
     towers = [tower for tower in turn.weapons() if not ready_only or (
         tower.cooldown == 0 and any(distance(tower.pos, robot.pos) <= tower.range_of_attack()
-                                   for robot in turn.robots)
+                                   for robot in target_robots)
     )]
     n = min(len(roles), len(towers))
     if n == 0:
@@ -151,6 +158,14 @@ def _pair_gunners(
             if score > best_score:
                 best_pairs, best_score = pairs, score
     return best_pairs
+
+
+def robots_threatening_us(turn: P.Turn) -> tuple[Robot, ...]:
+    """服务器已给出机器人目标阵营；对方浪潮不能阻塞本方修复与反击。"""
+    return tuple(
+        robot for robot in turn.robots
+        if not robot.target_team or robot.target_team == turn.team_type
+    )
 
 
 def _choose_targets(

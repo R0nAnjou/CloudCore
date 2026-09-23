@@ -11,7 +11,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-from .brain import decide
+from . import brain
 
 LOGGER = logging.getLogger(__name__)
 
@@ -34,30 +34,42 @@ class Handler(BaseHTTPRequestHandler):
 
         result_holder: dict[str, Any] = {}
         done = threading.Event()
+        state_lock = threading.Lock()
+        state = {"expired": False}
 
-        def worker() -> None:
-            try:
-                result_holder["value"] = decide(payload)
-            except Exception:
-                LOGGER.exception("decide failed, fallback")
-                result_holder["value"] = {
-                    # 旧指令可能已过期或跨越昼夜；空指令是唯一可靠兜底。
-                    "roleCommandMap": {},
-                    "prompt": "",
-                    "executeCmd": "",
-                }
-            finally:
-                done.set()
-
-        t = threading.Thread(target=worker, daemon=True)
-        t.start()
-        if not done.wait(timeout=DEADLINE_SECONDS):
-            LOGGER.error("decision timeout (round %s), fallback", payload.get("roundNo"))
-            result_holder["value"] = {
+        def fallback() -> dict[str, Any]:
+            return {
                 "roleCommandMap": {},
                 "prompt": "",
                 "executeCmd": "",
             }
+
+        def publish(value: dict[str, Any]) -> bool:
+            """超时判定与 MEMORY 提交共用同一发布关口。"""
+            with state_lock:
+                if state["expired"]:
+                    return False
+                result_holder["value"] = value
+                done.set()
+                return True
+
+        def worker() -> None:
+            try:
+                brain.decide_transactional(payload, publish)
+            except Exception:
+                LOGGER.exception("decide failed, fallback")
+                publish(fallback())
+
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+        if not done.wait(timeout=DEADLINE_SECONDS):
+            with state_lock:
+                if not done.is_set():
+                    state["expired"] = True
+                    LOGGER.error(
+                        "decision timeout (round %s), fallback", payload.get("roundNo")
+                    )
+                    result_holder["value"] = fallback()
         self._send(result_holder.get("value") or {"roleCommandMap": {}})
         LOGGER.info(
             "round %s handled in %.3fs", payload.get("roundNo"), time.monotonic() - start

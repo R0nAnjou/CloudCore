@@ -44,6 +44,8 @@ STONE_BUILD_BATCH = 5  # 避免每采一块石头就长途往返基地
 HEALTHY_WALL_RATIO = 0.8  # 白天尽早修墙，避免残血墙进入夜晚
 SELL_BATCH = 8
 NIGHT_ROBOT_CLEARANCE = 6
+NIGHT_ROBOT_RELEASE_CLEARANCE = 8
+NIGHT_RETREAT_HOLD_ROUNDS = 4
 
 
 @dataclass
@@ -139,8 +141,14 @@ def worker_night_safe(
     commands: dict[int, dict[str, Any]],
 ) -> bool:
     """B 工夜间持续采矿；机器人接近时先撤离，绝不为一块矿冒险。"""
+    relevant_robots = tuple(
+        robot for robot in turn.robots
+        if not robot.target_team or robot.target_team == turn.team_type
+        or distance(worker.pos, robot.pos) < NIGHT_ROBOT_CLEARANCE
+    )
+
     def clearance(pos: Pos) -> int:
-        return min((distance(pos, robot.pos) for robot in turn.robots), default=99)
+        return min((distance(pos, robot.pos) for robot in relevant_robots), default=99)
 
     def retreat() -> bool:
         blocked = turn.blocked(worker)
@@ -151,16 +159,55 @@ def worker_night_safe(
         ]
         if not candidates:
             return False
-        step = max(candidates, key=lambda pos: (clearance(pos), -distance(pos, worker.pos), -pos.x, -pos.y))
-        if clearance(step) <= clearance(worker.pos):
-            return False
+        history = memory.position_history.get(worker.unit_id, [])
+        previous = history[-2] if len(history) >= 2 else None
+        # 被夹击时允许横向绕行；不再要求每一步都严格增加最近机器人距离。
+        step = max(candidates, key=lambda pos: (
+            clearance(pos),
+            sum(distance(pos, robot.pos) for robot in relevant_robots),
+            pos != previous,
+            -pos.x,
+            -pos.y,
+        ))
         claimed.add(step)
         commands[worker.unit_id] = move_command(step)
         memory.lock_worker_target(worker.unit_id, "retreat", step)
         return True
 
-    if turn.robots and clearance(worker.pos) < NIGHT_ROBOT_CLEARANCE:
-        return retreat()
+    role_id = worker.unit_id
+    retreating = memory.worker_modes.get(role_id) == "retreat"
+    threatened = bool(relevant_robots) and clearance(worker.pos) < NIGHT_ROBOT_CLEARANCE
+    if threatened:
+        memory.worker_modes[role_id] = "retreat"
+        memory.worker_retreat_until[role_id] = max(
+            memory.worker_retreat_until.get(role_id, 0),
+            turn.round_no + NIGHT_RETREAT_HOLD_ROUNDS,
+        )
+        memory.worker_safe_streak[role_id] = 0
+        retreating = True
+
+    if retreating and not relevant_robots:
+        memory.worker_modes[role_id] = "income"
+        memory.worker_retreat_until.pop(role_id, None)
+        memory.worker_safe_streak.pop(role_id, None)
+        memory.clear_worker_target(role_id)
+        retreating = False
+    if retreating:
+        safely_clear = clearance(worker.pos) >= NIGHT_ROBOT_RELEASE_CLEARANCE
+        if safely_clear:
+            memory.worker_safe_streak[role_id] = memory.worker_safe_streak.get(role_id, 0) + 1
+        else:
+            memory.worker_safe_streak[role_id] = 0
+        may_release = (
+            turn.round_no >= memory.worker_retreat_until.get(role_id, 0)
+            and memory.worker_safe_streak.get(role_id, 0) >= 2
+        )
+        if not may_release:
+            return retreat()
+        memory.worker_modes[role_id] = "income"
+        memory.worker_retreat_until.pop(role_id, None)
+        memory.worker_safe_streak.pop(role_id, None)
+        memory.clear_worker_target(role_id)
 
     day = P.day_index(turn.round_no)
     trial_claimed = set(claimed)
@@ -498,6 +545,37 @@ def shopping_list(turn: P.Turn) -> list[tuple[str, int]]:
     if station is not None and station.level >= 2 and level2_wall is not None and gold >= 130:
         items.append((WALL_UP_V2, 1))
         gold -= 30
+    return items
+
+
+def emergency_shopping_list(turn: P.Turn) -> list[tuple[str, int]]:
+    """不受墙数门槛限制的救命物资；不在这里安排普通成长消费。"""
+    items: list[tuple[str, int]] = []
+    gold = turn.gold
+
+    def add(name: str, default_price: int) -> None:
+        nonlocal gold
+        price = turn.shop_prices.get(name, default_price)
+        if (gold >= price
+                and not any(role.has(name) for role in turn.controllable())):
+            items.append((name, 1))
+            gold -= price
+
+    station = turn.station()
+    if (station is not None and station.level < 3
+            and station.health < 1500 * max(1, station.level) * 0.65):
+        add(STATION_UP_V1 if station.level == 1 else STATION_UP_V2,
+            100 if station.level == 1 else 150)
+
+    walls = turn.walls()
+    if (walls and not any(worker.has(WALL_FIXER) for worker in turn.workers())
+            and any(wall.health < _wall_max_health(wall.level) * 0.35 for wall in walls)):
+        add(WALL_FIXER, 10)
+
+    if (any(role.health < (110 if role.kind == P.WORKER else 100)
+            for role in turn.controllable())
+            and not any(role.has(P.MEDICINE) for role in turn.controllable())):
+        add(P.MEDICINE, 10)
     return items
 
 

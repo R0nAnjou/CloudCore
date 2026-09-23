@@ -45,6 +45,11 @@ class Memory:
     # 工人的具体目标跨回合锁定，避免每回合重选矿点/墙位造成来回横跳。
     worker_targets: dict[int, Pos] = field(default_factory=dict)
     worker_target_kinds: dict[int, str] = field(default_factory=dict)
+    # 夜间撤退必须跨回合保持；否则矿点选择与一步逃跑会互相覆盖，形成来回横跳。
+    worker_retreat_until: dict[int, int] = field(default_factory=dict)
+    worker_safe_streak: dict[int, int] = field(default_factory=dict)
+    # 一旦本日开始送 B 出城，就保持到出城完成，避免临近夜幕重新判定后掉头。
+    night_miner_committed_day: dict[int, int] = field(default_factory=dict)
     # 被服务器拒绝的移动目标短期拉黑；否则相同状态会无限重发同一步。
     failed_move_until: dict[tuple[int, int, int], int] = field(default_factory=dict)
     position_history: dict[int, list[Pos]] = field(default_factory=dict)

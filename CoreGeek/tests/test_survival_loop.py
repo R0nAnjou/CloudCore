@@ -280,6 +280,63 @@ class SurvivalLoopTests(unittest.TestCase):
         step = P.Pos.load(commands[worker.unit_id]["targetPos"][0])
         self.assertGreater(P.distance(step, robot.pos), P.distance(worker.pos, robot.pos))
 
+    def test_night_miner_keeps_retreat_mode_instead_of_reversing_to_mine(self):
+        worker = replace(self.worker, pos=P.Pos(10, 10), backpack=())
+        mine = P.Pos(11, 10)
+        robot = P.Robot(1, P.Pos(8, 8), P.SMALL_ROBOT, 20, False, self.base.team_type)
+        memory = Memory(current_round=71)
+        turn = replace(
+            self.base, round_no=71, is_day=False, ours=(self.station, worker),
+            zones={mine: P.COPPER}, robots=(robot,), vendor_prices={P.COPPER: 10},
+        )
+        commands = {}
+        self.assertTrue(economy.worker_night_safe(turn, worker, memory, set(), commands))
+        first = P.Pos.load(commands[worker.unit_id]["targetPos"][0])
+        worker = replace(worker, pos=first)
+        memory.current_round = 72
+        memory.note_positions((worker,))
+        turn = replace(turn, round_no=72, ours=(self.station, worker))
+        commands = {}
+        self.assertTrue(economy.worker_night_safe(turn, worker, memory, set(), commands))
+        self.assertEqual("move", commands[worker.unit_id]["action"])
+        second = P.Pos.load(commands[worker.unit_id]["targetPos"][0])
+        self.assertNotEqual(P.Pos(10, 10), second)
+
+    def test_opponent_wave_does_not_block_our_post_wave_state(self):
+        other_team = "defender" if self.base.team_type == "challenger" else "challenger"
+        robot = P.Robot(1, P.Pos(20, 20), P.SMALL_ROBOT, 40, False, other_team)
+        turn = replace(self.base, round_no=90, is_day=False, robots=(robot,))
+        self.assertTrue(brain._post_wave_safe(turn))
+
+    def test_active_task_recovery_never_walks_to_shop(self):
+        pioneer = replace(self.sample.pioneers()[0], health=40, backpack=())
+        turn = replace(self.base, ours=(self.station, pioneer))
+        commands = {}
+        self.assertFalse(brain._recover_pioneer(
+            turn, pioneer, set(), commands, allow_travel=False,
+        ))
+        self.assertEqual({}, commands)
+
+        pioneer = replace(pioneer, backpack=(P.MEDICINE,))
+        commands = {}
+        self.assertTrue(brain._recover_pioneer(
+            turn, pioneer, set(), commands, allow_travel=False,
+        ))
+        self.assertEqual("use", commands[pioneer.unit_id]["action"])
+        self.assertNotIn("targetPos", commands[pioneer.unit_id])
+
+    def test_cancelled_decision_discards_candidate_memory(self):
+        live = Memory(current_round=12)
+
+        def fake_decide(_payload):
+            brain.MEMORY.current_round = 99
+            return {"roleCommandMap": {}, "prompt": "", "executeCmd": ""}
+
+        with patch.object(brain, "MEMORY", live), patch.object(brain, "decide", fake_decide):
+            self.assertFalse(brain.decide_transactional({}, lambda _result: False))
+            self.assertIs(brain.MEMORY, live)
+            self.assertEqual(12, brain.MEMORY.current_round)
+
     def test_night_sell_without_target_position_does_not_crash(self):
         worker = replace(
             self.worker, pos=P.Pos(5, 5), backpack=(P.COPPER,) * 8, capacity=10,
@@ -347,6 +404,30 @@ class SurvivalLoopTests(unittest.TestCase):
                 max(brain._enemy_projection(turn, pos) for pos in plan.wall_sites),
                 brain._enemy_projection(turn, plan.wall_sites[0]),
             )
+
+    def test_three_rocket_cluster_faces_enemy_from_every_corner(self):
+        corners = (
+            (P.Pos(3, 4), P.Pos(35, 27)),
+            (P.Pos(35, 4), P.Pos(3, 27)),
+            (P.Pos(3, 27), P.Pos(35, 4)),
+            (P.Pos(35, 27), P.Pos(3, 4)),
+        )
+        for station_pos, enemy_pos in corners:
+            with self.subTest(station=station_pos), patch.object(brain, "MEMORY", Memory()):
+                station = replace(self.station, pos=station_pos)
+                enemy = replace(self.station, unit_id=99999, pos=enemy_pos)
+                turn = replace(
+                    self.base, ours=(station,), enemy_roles=(enemy,), zones={},
+                )
+                plan = brain._build_plan(turn)
+                projections = [brain._enemy_projection(turn, pos) for pos in plan.tower_sites]
+                self.assertEqual(3, len(plan.tower_sites))
+                self.assertGreater(min(projections), 0)
+                self.assertTrue(all(
+                    P.distance(brain.MEMORY.gunner_pos, pos) <= 1
+                    for pos in plan.tower_sites
+                ))
+                self.assertNotIn(brain.MEMORY.gate_pos, brain._front_wall_sites(turn))
 
     def test_both_workers_build_until_first_night_wall_quota(self):
         with patch.object(brain, "MEMORY", Memory()):
