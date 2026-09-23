@@ -232,8 +232,8 @@ class DefenseEconomyTests(unittest.TestCase):
             tuple(command["targetPos"][0].values()) for command in commands.values()
             if command["action"] == "move"
         ]
-        self.assertEqual(2, len(destinations))
-        self.assertEqual(2, len(set(destinations)))
+        self.assertEqual(3, len(destinations))
+        self.assertEqual(3, len(set(destinations)))
         self.assertNotIn(workers[-1].unit_id, brain.MEMORY.returning_roles)
 
     def test_no_new_task_is_started_during_night_staging(self) -> None:

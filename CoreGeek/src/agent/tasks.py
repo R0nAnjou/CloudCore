@@ -31,7 +31,7 @@ KNOWN_SHOP_ITEMS = {
 }
 ACTIVE_TASK_STATES = {"accepting", "accepted", "exploring", "answering"}
 MAX_LLM_TOOL_CALLS = 5
-MIN_TASK_TIMEOUT = 16
+MIN_TASK_TIMEOUT = 10
 ALLOWED_TASK_TOOLS = {
     "python", "python3", "curl", "wget", "sqlite3", "jq",
     "pwd", "ls", "find", "cat", "sed", "grep", "head", "tail",

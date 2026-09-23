@@ -116,7 +116,14 @@ class SurvivalLoopTests(unittest.TestCase):
                     self.assertFalse(any(c["action"] == "build" and P.Pos.load(c["targetPos"][0]) == gate
                                          for c in commands.values()))
                 turn = self.apply_day(turn, commands)
-            self.assertTrue(all(brain._inside_defense(turn, role) for role in turn.controllable()))
+            night_miner = brain._night_miner(turn)
+            self.assertTrue(all(
+                brain._inside_defense(turn, role)
+                for role in turn.controllable()
+                if night_miner is None or role.unit_id != night_miner.unit_id
+            ))
+            if night_miner is not None:
+                self.assertFalse(brain._inside_defense(turn, night_miner))
             self.assertTrue(any(w.pos == gate for w in turn.walls()))
 
             mine = outside
@@ -273,6 +280,95 @@ class SurvivalLoopTests(unittest.TestCase):
         step = P.Pos.load(commands[worker.unit_id]["targetPos"][0])
         self.assertGreater(P.distance(step, robot.pos), P.distance(worker.pos, robot.pos))
 
+    def test_night_sell_without_target_position_does_not_crash(self):
+        worker = replace(
+            self.worker, pos=P.Pos(5, 5), backpack=(P.COPPER,) * 8, capacity=10,
+        )
+        turn = replace(
+            self.base, round_no=71, is_day=False, ours=(self.station, worker),
+            zones={P.Pos(6, 5): "vendor"}, vendor_prices={P.COPPER: 10}, robots=(),
+        )
+        commands = {}
+        self.assertTrue(economy.worker_night_safe(turn, worker, Memory(), set(), commands))
+        self.assertEqual("sell", commands[worker.unit_id]["action"])
+        self.assertNotIn("targetPos", commands[worker.unit_id])
+
+    def test_post_wave_a_repairs_while_b_keeps_mining(self):
+        first = replace(
+            self.worker, pos=P.Pos(5, 5), backpack=(P.WALL_FIXER,), capacity=10,
+        )
+        second = replace(
+            self.sample.workers()[1], pos=P.Pos(8, 8), backpack=(), capacity=10,
+        )
+        wall = replace(self.wall, pos=P.Pos(5, 6), health=200)
+        mine = P.Pos(9, 8)
+        turn = replace(
+            self.base, round_no=100, is_day=False,
+            ours=(self.station, first, second, wall), robots=(),
+            zones={mine: P.COPPER}, vendor_prices={P.COPPER: 10},
+        )
+        with patch.object(brain, "MEMORY", Memory()):
+            commands = {}
+            brain._night_phase(turn, commands)
+        self.assertEqual("use", commands[first.unit_id]["action"])
+        self.assertEqual(P.WALL_FIXER, commands[first.unit_id]["name"])
+        self.assertEqual("collect", commands[second.unit_id]["action"])
+
+    def test_failed_move_is_temporarily_blacklisted(self):
+        target = P.Pos(self.worker.pos.x + 1, self.worker.pos.y)
+        memory = Memory(
+            current_round=20,
+            last_commands={str(self.worker.unit_id): P.move_command(target)},
+        )
+        turn = replace(
+            self.base, round_no=21, ours=(self.station, self.worker),
+            last_action_results={self.worker.unit_id: False},
+        )
+        with patch.object(brain, "MEMORY", memory):
+            brain._learn_from_feedback(turn)
+        self.assertIn(target, memory.failed_move_cells(self.worker.unit_id))
+
+    def test_gate_is_behind_base_and_front_walls_are_built_first(self):
+        enemy_station = replace(
+            self.station, unit_id=99999,
+            pos=P.Pos(self.station.pos.x + 15, self.station.pos.y),
+        )
+        turn = replace(self.base, enemy_roles=(enemy_station,))
+        with patch.object(brain, "MEMORY", Memory()):
+            plan = brain._build_plan(turn)
+            gate = brain._gate_position(turn)
+            front = brain._front_wall_sites(turn)
+            self.assertNotIn(gate, front)
+            self.assertLess(
+                brain._enemy_projection(turn, gate),
+                min(brain._enemy_projection(turn, pos) for pos in front),
+            )
+            self.assertEqual(
+                max(brain._enemy_projection(turn, pos) for pos in plan.wall_sites),
+                brain._enemy_projection(turn, plan.wall_sites[0]),
+            )
+
+    def test_both_workers_build_until_first_night_wall_quota(self):
+        with patch.object(brain, "MEMORY", Memory()):
+            plan = brain._build_plan(self.base)
+            walls = tuple(
+                replace(self.wall, unit_id=41000 + index, pos=pos, health=1000)
+                for index, pos in enumerate(plan.wall_sites[:14])
+            )
+            workers = tuple(
+                replace(worker, pos=P.Pos(5 + index, 5), backpack=())
+                for index, worker in enumerate(self.sample.workers())
+            )
+            turn = replace(
+                self.base, round_no=20, ours=(self.station, *workers, *walls), zones={},
+            )
+            with patch.object(economy, "worker_day") as worker_day:
+                brain._day_phase(turn, {})
+        self.assertEqual(2, worker_day.call_count)
+        self.assertTrue(all(
+            call.kwargs["income_only"] is False for call in worker_day.call_args_list
+        ))
+
     def test_one_role_rotates_three_rockets_by_reported_cooldown(self):
         worker = replace(self.worker, pos=P.Pos(5, 5), backpack=())
         robots = (P.Robot(1, P.Pos(7, 7), P.BOSS_ROBOT, 800, False, self.base.team_type),)
@@ -324,6 +420,14 @@ class SurvivalLoopTests(unittest.TestCase):
         turn = replace(self.base, round_no=30, gold=100, ours=(self.station, self.rocket))
         self.assertEqual(P.WEAPON_UP_V1, economy.shopping_list(turn)[0][0])
         turn = replace(turn, ours=(replace(self.station, health=640), self.rocket))
+        self.assertEqual(P.STATION_UP_V1, economy.shopping_list(turn)[0][0])
+
+    def test_three_rockets_make_station_upgrade_the_first_growth_purchase(self):
+        rockets = tuple(
+            replace(self.rocket, unit_id=500 + index, pos=P.Pos(5 + index, 5))
+            for index in range(3)
+        )
+        turn = replace(self.base, round_no=30, gold=100, ours=(self.station, *rockets))
         self.assertEqual(P.STATION_UP_V1, economy.shopping_list(turn)[0][0])
 
     def test_carried_station_upgrade_can_save_base_at_night(self):
@@ -398,10 +502,10 @@ class SurvivalLoopTests(unittest.TestCase):
         memory = Memory(task_approach_point=first.position)
         self.assertEqual(first.position, tasks._pick_task_point(turn, role, memory))
 
-    def test_short_task_is_skipped_instead_of_timing_out(self):
+    def test_too_short_task_is_skipped_instead_of_timing_out(self):
         role = replace(self.sample.pioneers()[0], pos=P.Pos(9, 24))
         short = replace(self.sample.player_tasks[0], position=P.Pos(7, 24),
-                        timeout_rounds=10, cold_down=0, is_valid=True)
+                        timeout_rounds=8, cold_down=0, is_valid=True)
         turn = replace(self.base, round_no=10, ours=(self.station, role), player_tasks=(short,))
         self.assertIsNone(tasks._pick_task_point(turn, role, Memory()))
 

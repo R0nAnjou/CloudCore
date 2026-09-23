@@ -42,6 +42,12 @@ class Memory:
     build_failures: dict[tuple[int, int, str], int] = field(default_factory=dict)
     current_round: int = 0
     worker_modes: dict[int, str] = field(default_factory=dict)
+    # 工人的具体目标跨回合锁定，避免每回合重选矿点/墙位造成来回横跳。
+    worker_targets: dict[int, Pos] = field(default_factory=dict)
+    worker_target_kinds: dict[int, str] = field(default_factory=dict)
+    # 被服务器拒绝的移动目标短期拉黑；否则相同状态会无限重发同一步。
+    failed_move_until: dict[tuple[int, int, int], int] = field(default_factory=dict)
+    position_history: dict[int, list[Pos]] = field(default_factory=dict)
     returning_roles: set[int] = field(default_factory=set)
     gate_pos: Pos | None = None
     tower_layout: tuple[Pos, ...] = ()
@@ -93,6 +99,46 @@ class Memory:
     last_commands: dict[str, dict] = field(default_factory=dict)
     # 10) 调试统计
     rounds_seen: int = 0
+
+    def note_positions(self, roles) -> None:
+        for role in roles:
+            history = self.position_history.setdefault(role.unit_id, [])
+            if not history or history[-1] != role.pos:
+                history.append(role.pos)
+                del history[:-6]
+
+    def note_move_result(self, role_id: int, target: Pos, ok: bool) -> None:
+        key = (role_id, target.x, target.y)
+        if ok:
+            self.failed_move_until.pop(key, None)
+            return
+        self.failed_move_until[key] = self.current_round + 5
+        self.worker_targets.pop(role_id, None)
+        self.worker_target_kinds.pop(role_id, None)
+
+    def failed_move_cells(self, role_id: int) -> set[Pos]:
+        return {
+            Pos(x, y)
+            for (current_id, x, y), retry_after in self.failed_move_until.items()
+            if current_id == role_id and self.current_round < retry_after
+        }
+
+    def would_oscillate(self, role_id: int, target: Pos) -> bool:
+        history = self.position_history.get(role_id, [])
+        return (
+            len(history) >= 4
+            and history[-4] == history[-2]
+            and history[-3] == history[-1]
+            and target == history[-2]
+        )
+
+    def lock_worker_target(self, role_id: int, kind: str, target: Pos) -> None:
+        self.worker_target_kinds[role_id] = kind
+        self.worker_targets[role_id] = target
+
+    def clear_worker_target(self, role_id: int) -> None:
+        self.worker_target_kinds.pop(role_id, None)
+        self.worker_targets.pop(role_id, None)
 
     # ------------------------------------------------------------------
     def remember_news(self, day: int, official: str, folk: str) -> None:

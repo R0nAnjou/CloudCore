@@ -65,9 +65,11 @@ def worker_day(
     commands: dict[int, dict[str, Any]],
     *,
     income_only: bool = False,
+    force_stone: bool = False,
 ) -> None:
     """建造工补防线，矿工专注高价值矿和现金流。"""
     day = P.day_index(turn.round_no)
+    day_round = (turn.round_no - 1) % P.ROUNDS_PER_DAY + 1
     if income_only:
         if _try_sell(turn, worker, day, memory, claimed, commands, cash_first=True, stone_keep=0):
             return
@@ -75,7 +77,8 @@ def worker_day(
             turn, worker, day, memory, claimed, commands,
         ):
             return
-        _hold_near_station(turn, worker, claimed, commands)
+        if day_round < 55:
+            _hold_near_station(turn, worker, memory, claimed, commands)
         return
 
     walls_needed = any(
@@ -84,7 +87,13 @@ def worker_day(
     )
     towers_needed = bool(plan.tower_sites and turn.gold >= P.WEAPON_BUILD_COST)
     stone_count = worker.count(STONE)
-    day_round = (turn.round_no - 1) % P.ROUNDS_PER_DAY + 1
+
+    if force_stone and stone_count == 0:
+        if worker.backpack_full:
+            if _try_sell(turn, worker, day, memory, claimed, commands, stone_keep=0):
+                return
+        elif _try_collect_stone(turn, worker, memory, claimed, commands):
+            return
 
     # 持续消耗整批石头，不能建一块后又返回矿点补到阈值。
     mode = memory.worker_modes.setdefault(worker.unit_id, "build" if stone_count else "collect")
@@ -95,7 +104,7 @@ def worker_day(
     memory.worker_modes[worker.unit_id] = mode
     if (walls_needed and not towers_needed and mode == "collect"
             and not worker.backpack_full
-            and _try_collect_stone(turn, worker, claimed, commands)):
+            and _try_collect_stone(turn, worker, memory, claimed, commands)):
         return
 
     # 1) 建造优先(武器 > 围墙), 建造是白天限时机会
@@ -107,7 +116,7 @@ def worker_day(
         if worker.backpack_full:
             if _try_sell(turn, worker, day, memory, claimed, commands):
                 return
-        elif _try_collect_stone(turn, worker, claimed, commands):
+        elif _try_collect_stone(turn, worker, memory, claimed, commands):
             return
 
     # 2) 矿石达到批量阈值或背包将满时再卖，避免每采一个就横穿地图
@@ -119,7 +128,7 @@ def worker_day(
         return
 
     # 4) 没事做: 待在基地附近待命
-    _hold_near_station(turn, worker, claimed, commands)
+    _hold_near_station(turn, worker, memory, claimed, commands)
 
 
 def worker_night_safe(
@@ -137,7 +146,8 @@ def worker_night_safe(
         blocked = turn.blocked(worker)
         candidates = [
             pos for pos in neighbours(worker.pos)
-            if turn.land(pos) and pos not in blocked and pos not in claimed
+            if turn.land(pos) and pos not in blocked
+            and pos not in _move_reserved(memory, worker, claimed)
         ]
         if not candidates:
             return False
@@ -146,6 +156,7 @@ def worker_night_safe(
             return False
         claimed.add(step)
         commands[worker.unit_id] = move_command(step)
+        memory.lock_worker_target(worker.unit_id, "retreat", step)
         return True
 
     if turn.robots and clearance(worker.pos) < NIGHT_ROBOT_CLEARANCE:
@@ -162,8 +173,10 @@ def worker_night_safe(
     command = trial_commands.get(worker.unit_id)
     if not acted or command is None:
         return False
-    target = Pos.load(command["targetPos"][0])
-    exposed = target if command["action"] == "move" else worker.pos
+    # sell/buy 指令没有 targetPos；只有移动指令才会改变暴露位置。
+    target_raw = command.get("targetPos")
+    exposed = (Pos.load(target_raw[0])
+               if command["action"] == "move" and target_raw else worker.pos)
     if turn.robots and clearance(exposed) < NIGHT_ROBOT_CLEARANCE:
         return retreat()
     claimed.update(trial_claimed)
@@ -199,6 +212,10 @@ def _try_build(
         if site not in standing and worker.count(P.WALL_MATERIAL) > 0 and memory.build_allowed(site, WALL):
             jobs.append((site, WALL))
 
+    locked = memory.worker_targets.get(worker.unit_id)
+    if memory.worker_target_kinds.get(worker.unit_id) == "build" and locked is not None:
+        jobs.sort(key=lambda job: (job[0] != locked, distance(worker.pos, job[0])))
+
     for site, kind in jobs:
         if site in claimed_sites:
             continue
@@ -206,13 +223,19 @@ def _try_build(
             commands[worker.unit_id] = build_command(site, kind)
             claimed_sites.add(site)
             claimed.add(site)
+            memory.clear_worker_target(worker.unit_id)
             return True
-        step = next_step_adjacent(turn, worker, site, reserved=claimed)
+        step = next_step_adjacent(
+            turn, worker, site, reserved=_move_reserved(memory, worker, claimed),
+        )
         if step is not None and step not in claimed:
             claimed.add(step)
             commands[worker.unit_id] = move_command(step)
             claimed_sites.add(site)
+            memory.lock_worker_target(worker.unit_id, "build", site)
             return True
+    if memory.worker_target_kinds.get(worker.unit_id) == "build":
+        memory.clear_worker_target(worker.unit_id)
     return False
 
 
@@ -258,11 +281,15 @@ def _try_sell(
         return False
     if distance(worker.pos, vendor) <= 1:
         commands[worker.unit_id] = sell_command(best_ore, best_num)
+        memory.clear_worker_target(worker.unit_id)
         return True
-    step = next_step_adjacent(turn, worker, vendor, reserved=claimed)
+    step = next_step_adjacent(
+        turn, worker, vendor, reserved=_move_reserved(memory, worker, claimed),
+    )
     if step is not None and step not in claimed:
         claimed.add(step)
         commands[worker.unit_id] = move_command(step)
+        memory.lock_worker_target(worker.unit_id, "sell", vendor)
         return True
     return False
 
@@ -291,15 +318,23 @@ def _try_collect(
         (p for p in _all_mine_positions(turn) if p not in claimed),
         key=value,
     )
+    locked = memory.worker_targets.get(worker.unit_id)
+    if memory.worker_target_kinds.get(worker.unit_id) == "collect" and locked in candidates:
+        candidates.remove(locked)
+        candidates.insert(0, locked)
     for mine in candidates:
         if distance(worker.pos, mine) <= 1:
             claimed.add(mine)
             commands[worker.unit_id] = collect_command(mine)
+            memory.lock_worker_target(worker.unit_id, "collect", mine)
             return True
-        step = next_step_adjacent(turn, worker, mine, reserved=claimed)
+        step = next_step_adjacent(
+            turn, worker, mine, reserved=_move_reserved(memory, worker, claimed),
+        )
         if step is not None and step not in claimed:
             claimed.add(step)
             commands[worker.unit_id] = move_command(step)
+            memory.lock_worker_target(worker.unit_id, "collect", mine)
             return True
     return False
 
@@ -324,14 +359,22 @@ def _try_collect_income(
     vendor = turn.vendor_pos() or worker.pos
     mines.sort(key=lambda pos: -turn.vendor_prices.get(turn.zones[pos], 0) /
                (distance(worker.pos, pos) + distance(pos, vendor) + SELL_BATCH))
+    locked = memory.worker_targets.get(worker.unit_id)
+    if memory.worker_target_kinds.get(worker.unit_id) == "income" and locked in mines:
+        mines.remove(locked)
+        mines.insert(0, locked)
     for mine in mines:
         if distance(worker.pos, mine) <= 1:
             commands[worker.unit_id] = collect_command(mine)
+            memory.lock_worker_target(worker.unit_id, "income", mine)
             return True
-        step = next_step_adjacent(turn, worker, mine, reserved=claimed)
+        step = next_step_adjacent(
+            turn, worker, mine, reserved=_move_reserved(memory, worker, claimed),
+        )
         if step is not None and step not in claimed:
             claimed.add(step)
             commands[worker.unit_id] = move_command(step)
+            memory.lock_worker_target(worker.unit_id, "income", mine)
             return True
     return _try_collect(turn, worker, day, memory, claimed, commands)
 
@@ -339,19 +382,28 @@ def _try_collect_income(
 def _try_collect_stone(
     turn: P.Turn,
     worker: Unit,
+    memory: Memory,
     claimed: set[Pos],
     commands: dict[int, dict[str, Any]],
 ) -> bool:
     """防线缺口优先补石头；同一矿点允许多工人同时采集。"""
     mines = sorted(turn.mines_of(STONE), key=lambda pos: distance(worker.pos, pos))
+    locked = memory.worker_targets.get(worker.unit_id)
+    if memory.worker_target_kinds.get(worker.unit_id) == "stone" and locked in mines:
+        mines.remove(locked)
+        mines.insert(0, locked)
     for mine in mines:
         if distance(worker.pos, mine) <= 1:
             commands[worker.unit_id] = collect_command(mine)
+            memory.lock_worker_target(worker.unit_id, "stone", mine)
             return True
-        step = next_step_adjacent(turn, worker, mine, reserved=claimed)
+        step = next_step_adjacent(
+            turn, worker, mine, reserved=_move_reserved(memory, worker, claimed),
+        )
         if step is not None and step not in claimed:
             claimed.add(step)
             commands[worker.unit_id] = move_command(step)
+            memory.lock_worker_target(worker.unit_id, "stone", mine)
             return True
     return False
 
@@ -359,6 +411,7 @@ def _try_collect_stone(
 def _hold_near_station(
     turn: P.Turn,
     worker: Unit,
+    memory: Memory,
     claimed: set[Pos],
     commands: dict[int, dict[str, Any]],
 ) -> None:
@@ -369,10 +422,16 @@ def _hold_near_station(
     target = footprint[2]  # 基地左下格附近
     if distance(worker.pos, target) <= 1:
         return
-    step = next_step_adjacent_to_any(turn, worker, list(footprint), reserved=claimed)
+    step = next_step_adjacent_to_any(
+        turn, worker, list(footprint), reserved=_move_reserved(memory, worker, claimed),
+    )
     if step is not None and step not in claimed:
         claimed.add(step)
         commands[worker.unit_id] = move_command(step)
+
+
+def _move_reserved(memory: Memory, worker: Unit, claimed: set[Pos]) -> set[Pos]:
+    return set(claimed) | memory.failed_move_cells(worker.unit_id)
 
 
 def shopping_list(turn: P.Turn) -> list[tuple[str, int]]:
@@ -403,14 +462,14 @@ def shopping_list(turn: P.Turn) -> list[tuple[str, int]]:
     if walls and not has_repair_kit and critical_wall:
         add(WALL_FIXER, 10)
 
-    # 第一个火箭二级化扩大射程/弹数；随后先把基地升二级，防止第三夜被穿墙秒杀。
+    # 三炮成型后先把基地升二级，再扩第一门火箭；先抬高生存线，避免后期被秒基地。
     weapons = turn.weapons()
     level1_weapon = next((weapon for weapon in weapons if weapon.level == 1), None)
     has_level2_weapon = any(weapon.level >= 2 for weapon in weapons)
+    if station is not None and station.level == 1 and len(weapons) >= 3 and not urgent_station:
+        add(STATION_UP_V1, 100)
     if level1_weapon is not None and not has_level2_weapon:
         add(WEAPON_UP_V1, 100)
-    if station is not None and station.level == 1 and has_level2_weapon and not urgent_station:
-        add(STATION_UP_V1, 100)
     if level1_weapon is not None and has_level2_weapon:
         add(WEAPON_UP_V1, 100)
 
@@ -461,6 +520,7 @@ def move_or_repair_wall(
     *,
     urgent_only: bool = False,
     allow_move: bool = True,
+    memory: Memory | None = None,
 ) -> bool:
     """修复包已在背包时仍持续安排使用，不依赖本回合能否继续购买。"""
     if not role.has(WALL_FIXER):
@@ -483,14 +543,19 @@ def move_or_repair_wall(
     if distance(role.pos, wall.pos) <= 1:
         commands[role.unit_id] = use_command(WALL_FIXER, wall.pos)
         claimed.add(wall.pos)
+        if memory is not None:
+            memory.clear_worker_target(role.unit_id)
         return True
     if urgent_only or not allow_move:
         return False  # 夜间不要为了远处的墙放弃炮位
-    step = next_step_adjacent(turn, role, wall.pos, reserved=claimed)
+    reserved = claimed if memory is None else _move_reserved(memory, role, claimed)
+    step = next_step_adjacent(turn, role, wall.pos, reserved=reserved)
     if step is not None and step not in claimed:
         claimed.add(step)
         commands[role.unit_id] = move_command(step)
         claimed.add(wall.pos)
+        if memory is not None:
+            memory.lock_worker_target(role.unit_id, "repair", wall.pos)
         return True
     return False
 
