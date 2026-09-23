@@ -29,17 +29,17 @@ class DefenseEconomyTests(unittest.TestCase):
             plan = brain._build_plan(turn)
         self.assertEqual(3, len(plan.tower_sites))
         self.assertEqual(("rocket", "rocket", "rocket"), plan.tower_kinds)
-        self.assertEqual(19, len(plan.wall_sites))
+        self.assertEqual(27, len(plan.wall_sites))
         inside_worker = replace(self.worker, pos=Pos(9, 24))
         turn = replace(turn, round_no=65, ours=(self.station, inside_worker))
         with patch.object(brain, "MEMORY", Memory()):
             plan = brain._build_plan(turn)
-        self.assertEqual(20, len(plan.wall_sites))
+        self.assertEqual(28, len(plan.wall_sites))
         outside_worker = replace(inside_worker, pos=Pos(5, 22))
         turn = replace(turn, ours=(self.station, outside_worker))
         with patch.object(brain, "MEMORY", Memory()):
             plan = brain._build_plan(turn)
-        self.assertEqual(19, len(plan.wall_sites))
+        self.assertEqual(27, len(plan.wall_sites))
 
     def test_worker_returns_inside_before_first_night(self) -> None:
         worker = replace(self.worker, pos=Pos(5, 22), backpack=("stone",))
@@ -58,7 +58,7 @@ class DefenseEconomyTests(unittest.TestCase):
         with patch.object(brain, "MEMORY", Memory()):
             plan = brain._build_plan(empty)
         gate = next(pos for pos in brain._ring(
-            brain.station_footprint(self.station.pos), 2,
+            brain.station_footprint(self.station.pos), 3,
         ) if pos not in plan.wall_sites)
         walls = tuple(
             replace(self.wall, unit_id=40000 + index, pos=pos, health=1000)
@@ -84,14 +84,14 @@ class DefenseEconomyTests(unittest.TestCase):
         with patch.object(brain, "MEMORY", Memory()):
             plan = brain._build_plan(empty)
         gate = next(pos for pos in brain._ring(
-            brain.station_footprint(self.station.pos), 2,
+            brain.station_footprint(self.station.pos), 3,
         ) if pos not in plan.wall_sites)
         walls = tuple(
             replace(self.wall, unit_id=40000 + index, pos=pos, health=1000)
             for index, pos in enumerate(plan.wall_sites)
         )
         inner = next(
-            pos for pos in brain._ring(brain.station_footprint(self.station.pos), 1)
+            pos for pos in brain._ring(brain.station_footprint(self.station.pos), 2)
             if max(abs(pos.x - gate.x), abs(pos.y - gate.y)) == 1
         )
         worker = replace(self.worker, pos=inner, backpack=("stone",))
@@ -272,10 +272,18 @@ class DefenseEconomyTests(unittest.TestCase):
         self.assertEqual("use", commands[worker.unit_id]["action"])
         self.assertEqual(STATION_UP_V1, commands[worker.unit_id]["name"])
 
-    def test_repair_kit_is_bought_before_night_if_affordable(self) -> None:
+    def test_noncritical_repair_kit_does_not_spend_upgrade_savings(self) -> None:
         turn = replace(
             self.turn, round_no=60, is_day=True, gold=10,
             ours=(self.station, self.wall, self.worker),
+        )
+        self.assertEqual([], economy.shopping_list(turn))
+
+    def test_critical_wall_still_buys_emergency_repair_kit(self) -> None:
+        wall = replace(self.wall, health=300)
+        turn = replace(
+            self.turn, round_no=60, is_day=True, gold=10,
+            ours=(self.station, wall, self.worker),
         )
         self.assertEqual([(WALL_FIXER, 1)], economy.shopping_list(turn))
 

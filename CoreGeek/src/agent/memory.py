@@ -45,7 +45,10 @@ class Memory:
     returning_roles: set[int] = field(default_factory=set)
     gate_pos: Pos | None = None
     tower_layout: tuple[Pos, ...] = ()
+    gunner_pos: Pos | None = None
     task_outcomes: dict[Pos, tuple[int, int]] = field(default_factory=dict)
+    # 锁定正在赶往的自进化任务点，避免逐回合重选造成左右横跳。
+    task_approach_point: Pos | None = None
     # 2) 每日官方新闻存档 {day: text}
     official_news: dict[int, str] = field(default_factory=dict)
     # 3) 每日民间传闻存档 {day: text}
@@ -135,6 +138,9 @@ class Memory:
             wins, attempts = self.task_outcomes.get(self.task_point, (0, 0))
             self.task_outcomes[self.task_point] = (wins + int(completed), attempts + 1)
 
+    def clear_task_approach(self) -> None:
+        self.task_approach_point = None
+
     # ------------------------------------------------------------------
     def llm_budget_left(self, day: int) -> int:
         if self.llm_day != day:
@@ -151,6 +157,7 @@ class Memory:
 
     def reset_task(self) -> None:
         self.task_state = "idle"
+        self.clear_task_approach()
         self.task_started_round = 0
         self.task_point = None
         self.task_desc = ""

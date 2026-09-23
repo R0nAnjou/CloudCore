@@ -121,6 +121,22 @@ def worker_day(
     _hold_near_station(turn, worker, claimed, commands)
 
 
+def worker_night_safe(
+    turn: P.Turn,
+    worker: Unit,
+    memory: Memory,
+    claimed: set[Pos],
+    commands: dict[int, dict[str, Any]],
+) -> bool:
+    """机器人清空后的夜间安全采矿/卖矿；绝不建造或离开敌方占格的寻路规则。"""
+    day = P.day_index(turn.round_no)
+    if _try_sell(turn, worker, day, memory, claimed, commands):
+        return True
+    if not worker.backpack_full and _try_collect_income(turn, worker, day, memory, claimed, commands):
+        return True
+    return False
+
+
 def _try_build(
     turn: P.Turn,
     worker: Unit,
@@ -326,7 +342,7 @@ def _hold_near_station(
 
 
 def shopping_list(turn: P.Turn) -> list[tuple[str, int]]:
-    """残血基地优先救命，健康基地优先提升火力；购物必须包含实际兑现。"""
+    """先形成火力/基地成长闭环；消耗品只处理真正紧急的缺口。"""
     items: list[tuple[str, int]] = []
     gold = turn.gold
     station = turn.station()
@@ -343,22 +359,39 @@ def shopping_list(turn: P.Turn) -> list[tuple[str, int]]:
     station_item = (STATION_UP_V1, 100) if station and station.level == 1 else (STATION_UP_V2, 150)
     if urgent_station and station.level < 3:
         add(*station_item)
-    if any(worker.health < 132 for worker in turn.workers()):
-        add(P.MEDICINE, 10)
     walls = turn.walls()
     day_round = (turn.round_no - 1) % P.ROUNDS_PER_DAY + 1
     has_repair_kit = any(worker.has(WALL_FIXER) for worker in turn.workers())
-    if (walls and not has_repair_kit and gold >= 10
+    critical_wall = any(
+        wall.health < _wall_max_health(wall.level) * 0.35
+        for wall in walls
+    )
+    if walls and not has_repair_kit and critical_wall:
+        add(WALL_FIXER, 10)
+
+    # 第一个火箭二级化扩大射程/弹数；随后先把基地升二级，防止第三夜被穿墙秒杀。
+    weapons = turn.weapons()
+    level1_weapon = next((weapon for weapon in weapons if weapon.level == 1), None)
+    has_level2_weapon = any(weapon.level >= 2 for weapon in weapons)
+    if level1_weapon is not None and not has_level2_weapon:
+        add(WEAPON_UP_V1, 100)
+    if station is not None and station.level == 1 and has_level2_weapon and not urgent_station:
+        add(STATION_UP_V1, 100)
+    if level1_weapon is not None and has_level2_weapon:
+        add(WEAPON_UP_V1, 100)
+
+    if any(worker.health < 110 for worker in turn.workers()):
+        add(P.MEDICINE, 10)
+    # 非紧急修复包不能反复吞掉升级储蓄；升级预算之外有余钱时再购买。
+    growth_pending = (level1_weapon is not None
+                      or station is not None and station.level == 1)
+    if (walls and not has_repair_kit and not critical_wall
+            and (not growth_pending or gold >= 110)
             and (day_round >= 55 or any(
                 wall.health < _wall_max_health(wall.level) * HEALTHY_WALL_RATIO
                 for wall in walls
             ))):
         add(WALL_FIXER, 10)
-    level1_weapon = next((weapon for weapon in turn.weapons() if weapon.level == 1), None)
-    if level1_weapon is not None:
-        add(WEAPON_UP_V1, 100)
-    if station is not None and station.level == 1 and not urgent_station:
-        add(STATION_UP_V1, 100)
     level2_weapon = next((weapon for weapon in turn.weapons() if weapon.level == 2), None)
     if level2_weapon is not None:
         add(WEAPON_UP_V2, 150)

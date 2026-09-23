@@ -7,6 +7,7 @@
 伤害本回合结束统一结算 -> 集火判断按"累计伤害 >= HP"的最小火力集合。
 """
 from itertools import combinations, permutations
+import logging
 from typing import Any
 
 from . import protocol as P, economy
@@ -28,6 +29,7 @@ from .protocol import (
 )
 
 ROBOT_THREAT_VALUE = {SMALL_ROBOT: 5, MIDDLE_ROBOT: 12, LARGE_ROBOT: 30, BOSS_ROBOT: 60}
+LOGGER = logging.getLogger(__name__)
 
 
 def night(
@@ -60,6 +62,24 @@ def night(
         _deduct_expected(tower, targets, list(turn.robots), remaining_hp)
         claimed.add(gunner.pos)
 
+    # 本方机器人浪潮已清空后，空闲火箭继续轰击射程内敌方城墙。
+    if not turn.robots and not any(command.get("action") == "attack" for command in commands.values()):
+        counter = _post_wave_wall_attack(turn, unavailable_role_ids | set(commands))
+        if counter is not None:
+            tower, gunner, targets = counter
+            if distance(gunner.pos, tower.pos) > 1:
+                step = next_step_adjacent(turn, gunner, tower.pos, reserved=claimed)
+                if step is not None and step not in claimed:
+                    claimed.add(step)
+                    commands[gunner.unit_id] = move_command(step)
+            else:
+                commands[tower.unit_id] = attack_command(gunner.unit_id, targets)
+                claimed.add(gunner.pos)
+                LOGGER.info(
+                    "post-wave counterfire tower=%d controller=%d wall=%s missiles=%d",
+                    tower.unit_id, gunner.unit_id, targets[0], len(targets),
+                )
+
     # 只占用真正开火或移动的炮手；冷却空窗可修身边的墙。
     busy = unavailable_role_ids | set(commands)
     busy.update(int(command["controllerId"]) for command in commands.values()
@@ -70,6 +90,34 @@ def night(
                 busy.add(role.unit_id)
     # 没有配到武器的角色: 撤回基地附近避险
     _evacuate_idle_roles(turn, pairs, claimed, commands, busy)
+
+
+def _post_wave_wall_attack(
+    turn: P.Turn,
+    unavailable_role_ids: set[int],
+) -> tuple[Unit, Unit, list[Pos]] | None:
+    """选择一座可控火箭，向最脆弱的射程内敌方墙叠加导弹。"""
+    walls = [unit for unit in turn.enemy_roles if unit.kind == P.WALL and unit.health > 0]
+    roles = [role for role in turn.controllable() if role.unit_id not in unavailable_role_ids]
+    if not walls or not roles:
+        return None
+    candidates: list[tuple[int, int, int, Unit, Unit, Unit]] = []
+    for tower in turn.weapons():
+        if tower.kind != ROCKET or tower.cooldown > 0:
+            continue
+        reachable = [wall for wall in walls if distance(tower.pos, wall.pos) <= tower.range_of_attack()]
+        if not reachable:
+            continue
+        target = min(reachable, key=lambda wall: (wall.health, distance(tower.pos, wall.pos), wall.unit_id))
+        for gunner in roles:
+            candidates.append((
+                distance(gunner.pos, tower.pos), target.health,
+                distance(tower.pos, target.pos), tower, gunner, target,
+            ))
+    if not candidates:
+        return None
+    _, _, _, tower, gunner, target = min(candidates, key=lambda item: item[:3])
+    return tower, gunner, [target.pos] * max(1, tower.level)
 
 
 def _pair_gunners(

@@ -31,6 +31,7 @@ KNOWN_SHOP_ITEMS = {
 }
 ACTIVE_TASK_STATES = {"accepting", "accepted", "exploring", "answering"}
 MAX_LLM_TOOL_CALLS = 5
+MIN_TASK_TIMEOUT = 16
 ALLOWED_TASK_TOOLS = {
     "python", "python3", "curl", "wget", "sqlite3", "jq",
     "pwd", "ls", "find", "cat", "sed", "grep", "head", "tail",
@@ -93,13 +94,19 @@ def pioneer(
                 memory.task_state = "accepting"
                 memory.task_started_round = turn.round_no
                 memory.task_point = target
+                memory.clear_task_approach()
                 LOGGER.info("requesting task at %s", target)
                 return inference_prompt, ""
+            # 途中不重新按距离打分选另一个任务点；固定目的地后，每回合只重算安全路径。
+            memory.task_approach_point = target
             step = next_step_adjacent(turn, pioneer_role, target, reserved=claimed)
             if step is not None and step not in claimed:
                 claimed.add(step)
                 commands[pioneer_role.unit_id] = move_command(step)
                 return inference_prompt, ""
+            memory.clear_task_approach()
+    else:
+        memory.clear_task_approach()
 
     return inference_prompt, ""
 
@@ -177,7 +184,11 @@ def _reject_task_answer(memory: Memory, reason: str) -> None:
     memory.pending_prompt_kind = ""
 
 
-def _pick_task_point(turn: P.Turn, role: Unit | None = None, memory: Memory | None = None) -> Pos | None:
+def _pick_task_point(
+    turn: P.Turn,
+    role: Unit | None = None,
+    memory: Memory | None = None,
+) -> Pos | None:
     ready = [task for task in turn.player_tasks if task.is_valid and task.cold_down == 0]
     if not ready:
         return None
@@ -199,13 +210,27 @@ def _pick_task_point(turn: P.Turn, role: Unit | None = None, memory: Memory | No
                 continue
             return_steps = len(back)
         duration = task.timeout_rounds or 12
-        daylight = 70 - ((turn.round_no - 1) % P.ROUNDS_PER_DAY + 1)
-        if travel + duration + return_steps + 3 > daylight:
+        # 实战中 10~12 回合任务来不及完成“查文件→查接口→LLM作答”的闭环，反复超时只会浪费昼间。
+        if task.timeout_rounds and task.timeout_rounds < MIN_TASK_TIMEOUT:
+            continue
+        phase_round = (turn.round_no - 1) % P.ROUNDS_PER_DAY + 1
+        if not turn.is_day:
+            continue
+        rounds_left = P.DAY_ROUNDS - phase_round
+        if travel + duration + return_steps + 3 > rounds_left:
             continue
         wins, attempts = memory.task_outcomes.get(task.position, (0, 0)) if memory else (0, 0)
         probability = (wins + 1) / (attempts + 2)
         value = probability * (task.score_reward + task.gold_reward) / max(1, travel + duration)
         scored.append((value, task.position))
+    if memory and memory.task_approach_point is not None:
+        locked = next(
+            (position for _, position in scored if position == memory.task_approach_point),
+            None,
+        )
+        if locked is not None:
+            return locked
+        memory.clear_task_approach()
     return max(scored, key=lambda item: item[0])[1] if scored else None
 
 
