@@ -37,6 +37,8 @@ def night(
     claimed: set[Pos],
     commands: dict[int, dict[str, Any]],
     unavailable_role_ids: set[int] | None = None,
+    *,
+    allow_counterfire: bool = True,
 ) -> None:
     """夜晚主流程: 为每座武器配一名炮手, 选目标开火; 无武器时角色撤回基地。"""
     unavailable_role_ids = unavailable_role_ids or set()
@@ -65,8 +67,8 @@ def night(
         _deduct_expected(tower, targets, defensive_robots, remaining_hp)
         claimed.add(gunner.pos)
 
-    # 本方机器人浪潮已清空后，空闲火箭继续轰击射程内敌方城墙。
-    if not defensive_robots and not any(
+    # 本方浪潮清空后，空闲火箭优先轰敌方基地；基地超射程才拆最低血墙。
+    if allow_counterfire and not defensive_robots and not any(
         command.get("action") == "attack" for command in commands.values()
     ):
         counter = _post_wave_wall_attack(turn, unavailable_role_ids | set(commands))
@@ -81,7 +83,7 @@ def night(
                 commands[tower.unit_id] = attack_command(gunner.unit_id, targets)
                 claimed.add(gunner.pos)
                 LOGGER.info(
-                    "post-wave counterfire tower=%d controller=%d wall=%s missiles=%d",
+                    "post-wave counterfire tower=%d controller=%d target=%s missiles=%d",
                     tower.unit_id, gunner.unit_id, targets[0], len(targets),
                 )
 
@@ -101,27 +103,44 @@ def _post_wave_wall_attack(
     turn: P.Turn,
     unavailable_role_ids: set[int],
 ) -> tuple[Unit, Unit, list[Pos]] | None:
-    """选择一座可控火箭，向最脆弱的射程内敌方墙叠加导弹。"""
+    """选择一座可控火箭；射程内优先敌方基地，否则攻击最脆弱的墙。"""
     walls = [unit for unit in turn.enemy_roles if unit.kind == P.WALL and unit.health > 0]
+    enemy_station = next(
+        (unit for unit in turn.enemy_roles if unit.kind == P.STATION and unit.health > 0),
+        None,
+    )
     roles = [role for role in turn.controllable() if role.unit_id not in unavailable_role_ids]
-    if not walls or not roles:
+    if (enemy_station is None and not walls) or not roles:
         return None
-    candidates: list[tuple[int, int, int, Unit, Unit, Unit]] = []
+    candidates: list[tuple[int, int, int, int, Unit, Unit, Unit]] = []
     for tower in turn.weapons():
         if tower.kind != ROCKET or tower.cooldown > 0:
             continue
-        reachable = [wall for wall in walls if distance(tower.pos, wall.pos) <= tower.range_of_attack()]
-        if not reachable:
+        reachable = [
+            wall for wall in walls
+            if distance(tower.pos, wall.pos) <= tower.range_of_attack()
+        ]
+        station_reachable = (
+            enemy_station is not None
+            and any(distance(tower.pos, pos) <= tower.range_of_attack()
+                    for pos in P.station_footprint(enemy_station.pos))
+        )
+        target = enemy_station if station_reachable else min(
+            reachable,
+            key=lambda wall: (wall.health, distance(tower.pos, wall.pos), wall.unit_id),
+            default=None,
+        )
+        if target is None:
             continue
-        target = min(reachable, key=lambda wall: (wall.health, distance(tower.pos, wall.pos), wall.unit_id))
         for gunner in roles:
             candidates.append((
+                0 if target.kind == P.STATION else 1,
                 distance(gunner.pos, tower.pos), target.health,
                 distance(tower.pos, target.pos), tower, gunner, target,
             ))
     if not candidates:
         return None
-    _, _, _, tower, gunner, target = min(candidates, key=lambda item: item[:3])
+    _, _, _, _, tower, gunner, target = min(candidates, key=lambda item: item[:4])
     return tower, gunner, [target.pos] * max(1, tower.level)
 
 

@@ -259,9 +259,11 @@ def _try_build(
         if site not in standing and worker.count(P.WALL_MATERIAL) > 0 and memory.build_allowed(site, WALL):
             jobs.append((site, WALL))
 
+    jobs.sort(key=lambda job: (job[1] == WALL, distance(worker.pos, job[0])))
     locked = memory.worker_targets.get(worker.unit_id)
     if memory.worker_target_kinds.get(worker.unit_id) == "build" and locked is not None:
-        jobs.sort(key=lambda job: (job[0] != locked, distance(worker.pos, job[0])))
+        jobs.sort(key=lambda job: (job[0] != locked, job[1] == WALL,
+                                   distance(worker.pos, job[0])))
 
     for site, kind in jobs:
         if site in claimed_sites:
@@ -485,20 +487,27 @@ def _move_reserved(memory: Memory, worker: Unit, claimed: set[Pos]) -> set[Pos]:
 
 
 def shopping_list(turn: P.Turn) -> list[tuple[str, int]]:
-    """先形成火力/基地成长闭环；消耗品只处理真正紧急的缺口。"""
+    """先形成 3-2-1 火力核心，再买基地保险，随后把三炮补到三级。"""
     items: list[tuple[str, int]] = []
     gold = turn.gold
     station = turn.station()
-    def add(name: str, price: int) -> bool:
+
+    def owned(name: str) -> int:
+        return sum(role.count(name) for role in turn.controllable())
+
+    def add(name: str, price: int, *, target: int = 1) -> bool:
         nonlocal gold
         price = turn.shop_prices.get(name, price)
-        if gold < price or any(role.has(name) for role in turn.controllable()):
+        missing = max(0, target - owned(name)
+                      - sum(num for current, num in items if current == name))
+        quantity = min(missing, gold // max(1, price))
+        if quantity <= 0:
             return False
-        items.append((name, 1))
-        gold -= price
+        items.append((name, quantity))
+        gold -= price * quantity
         return True
 
-    urgent_station = station is not None and station.health < 1500 * max(1, station.level) * 0.65
+    urgent_station = station is not None and station.health < 1500 * max(1, station.level) * 0.50
     station_item = (STATION_UP_V1, 100) if station and station.level == 1 else (STATION_UP_V2, 150)
     if urgent_station and station.level < 3:
         add(*station_item)
@@ -512,41 +521,53 @@ def shopping_list(turn: P.Turn) -> list[tuple[str, int]]:
     if walls and not has_repair_kit and critical_wall:
         add(WALL_FIXER, 10)
 
-    # 三炮成型后先把基地升二级，再扩第一门火箭；先抬高生存线，避免后期被秒基地。
     weapons = turn.weapons()
-    level1_weapon = next((weapon for weapon in weapons if weapon.level == 1), None)
-    if station is not None and station.level == 1 and len(weapons) >= 3 and not urgent_station:
-        add(STATION_UP_V1, 100)
-    # 无论是否已有二级炮，只要还有一级炮就继续买一级升级券。
-    # 原先两个互补分支内容完全相同，既容易误读，也掩盖了真实的成长顺序。
-    if level1_weapon is not None:
-        add(WEAPON_UP_V1, 100)
+    levels = sorted((weapon.level for weapon in weapons), reverse=True)
+    core_battery = len(levels) >= 3 and levels[0] >= 3 and levels[1] >= 2
+    station_insurance = (
+        station is not None and station.level == 1
+        and station.health < 1500 * 0.90 and core_battery
+    )
+
+    # 对战日志中的关键顺序：2-1-1 -> 3-1-1 -> 3-2-1。达到该核心后，
+    # 若基地已经受损则插入一张基地升级券作为回血保险，再继续补齐三门三级炮。
+    if len(weapons) >= 3 and not urgent_station:
+        if station_insurance:
+            add(STATION_UP_V1, 100)
+        elif any(weapon.level == 1 for weapon in weapons):
+            add(WEAPON_UP_V1, 100)
+        elif any(weapon.level == 2 for weapon in weapons):
+            add(WEAPON_UP_V2, 150)
 
     if any(worker.health < 110 for worker in turn.workers()):
         add(P.MEDICINE, 10)
-    # 非紧急修复包不能反复吞掉升级储蓄；升级预算之外有余钱时再购买。
-    growth_pending = (level1_weapon is not None
-                      or station is not None and station.level == 1)
-    if (walls and not has_repair_kit and not critical_wall
-            and (not growth_pending or gold >= 110)
+    # 非紧急修复包只使用升级后的剩余预算，逐步把全队库存补到 3 个。
+    growth_pending = len(weapons) < 3 or any(weapon.level < 3 for weapon in weapons)
+    if (walls and sum(worker.count(WALL_FIXER) for worker in turn.workers()) < 3
+            and not critical_wall
+            and (not growth_pending or gold >= 160)
             and (day_round >= 55 or any(
                 wall.health < _wall_max_health(wall.level) * HEALTHY_WALL_RATIO
                 for wall in walls
             ))):
-        add(WALL_FIXER, 10)
-    level2_weapon = next((weapon for weapon in turn.weapons() if weapon.level == 2), None)
-    if level2_weapon is not None:
-        add(WEAPON_UP_V2, 150)
-    if station is not None and station.level == 2 and not urgent_station:
+        add(WALL_FIXER, 10, target=3)
+
+    # 三炮满级后再做普通基地成长；紧急基地升级已经在函数开头处理。
+    if (station is not None and station.level == 1 and not urgent_station
+            and len(weapons) >= 3 and all(weapon.level >= 3 for weapon in weapons)):
+        add(STATION_UP_V1, 100)
+    if (station is not None and station.level == 2 and not urgent_station
+            and len(weapons) >= 3 and all(weapon.level >= 3 for weapon in weapons)):
         add(STATION_UP_V2, 150)
+
     level1_wall = next((wall for wall in turn.walls() if wall.level == 1), None)
-    if station is not None and station.level >= 2 and level1_wall is not None and gold >= 120:
-        items.append((WALL_UP_V1, 1))
-        gold -= 20
+    if (len(levels) >= 2 and levels[0] >= 3 and levels[1] >= 3
+            and level1_wall is not None and gold >= 20):
+        add(WALL_UP_V1, 20)
     level2_wall = next((wall for wall in turn.walls() if wall.level == 2), None)
-    if station is not None and station.level >= 2 and level2_wall is not None and gold >= 130:
-        items.append((WALL_UP_V2, 1))
-        gold -= 30
+    if (len(levels) >= 3 and all(level >= 3 for level in levels[:3])
+            and level2_wall is not None and gold >= 30):
+        add(WALL_UP_V2, 30)
     return items
 
 
@@ -565,7 +586,7 @@ def emergency_shopping_list(turn: P.Turn) -> list[tuple[str, int]]:
 
     station = turn.station()
     if (station is not None and station.level < 3
-            and station.health < 1500 * max(1, station.level) * 0.65):
+            and station.health < 1500 * max(1, station.level) * 0.50):
         add(STATION_UP_V1 if station.level == 1 else STATION_UP_V2,
             100 if station.level == 1 else 150)
 

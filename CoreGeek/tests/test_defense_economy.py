@@ -23,34 +23,52 @@ class DefenseEconomyTests(unittest.TestCase):
         self.wall = self.turn.walls()[0]
         self.assertIsNotNone(self.station)
 
-    def test_wall_gate_closes_only_after_workers_are_inside(self) -> None:
+    def test_c_wall_expands_only_after_core_defense_is_funded(self) -> None:
         turn = replace(self.turn, round_no=1, is_day=True, ours=(self.station,), zones={})
         with patch.object(brain, "MEMORY", Memory()):
             plan = brain._build_plan(turn)
-        self.assertEqual(3, len(plan.tower_sites))
-        self.assertEqual(("rocket", "rocket", "rocket"), plan.tower_kinds)
-        self.assertEqual(18, len(plan.wall_sites))
-        inside_worker = replace(self.worker, pos=Pos(9, 24))
-        turn = replace(turn, round_no=65, ours=(self.station, inside_worker))
-        with patch.object(brain, "MEMORY", Memory()):
-            plan = brain._build_plan(turn)
-        self.assertEqual(20, len(plan.wall_sites))
-        outside_worker = replace(inside_worker, pos=Pos(5, 22))
-        turn = replace(turn, ours=(self.station, outside_worker))
-        with patch.object(brain, "MEMORY", Memory()):
-            plan = brain._build_plan(turn)
-        self.assertEqual(18, len(plan.wall_sites))
+            gate = brain._gate_position(turn)
+            service = brain._service_gate_position(turn)
+            self.assertEqual(3, len(plan.tower_sites))
+            self.assertEqual(("rocket", "rocket", "rocket"), plan.tower_kinds)
+            self.assertEqual(10, len(plan.wall_sites))
+            self.assertNotIn(gate, plan.wall_sites)
+            self.assertNotIn(service, plan.wall_sites)
+            day_two = brain._build_plan(replace(turn, round_no=131))
+            self.assertEqual(10, len(day_two.wall_sites))
 
-    def test_outside_income_worker_does_not_block_gate_closing(self) -> None:
+            rockets = tuple(
+                replace(
+                    self.turn.weapons()[0], unit_id=500 + index, pos=pos,
+                    kind=P.ROCKET, level=3, health=2000,
+                )
+                for index, pos in enumerate(plan.tower_sites)
+            )
+            front_walls = tuple(
+                replace(self.wall, unit_id=40000 + index, pos=pos, level=2, health=1500)
+                for index, pos in enumerate(plan.wall_sites[:6])
+            )
+            ready = replace(
+                turn, round_no=391, gold=250,
+                ours=(self.station, *rockets, *front_walls),
+            )
+            expanded = brain._build_plan(ready)
+            self.assertEqual(18, len(expanded.wall_sites))
+            self.assertNotIn(gate, expanded.wall_sites)
+            self.assertNotIn(service, expanded.wall_sites)
+
+    def test_outside_income_worker_is_not_marked_for_return(self) -> None:
         defender = replace(self.turn.workers()[0], pos=Pos(9, 24), backpack=("stone",))
         miner = replace(self.turn.workers()[1], pos=Pos(5, 22), backpack=())
+        # 编号较小者是固定矿工。
+        defender, miner = miner, defender
         turn = replace(
             self.turn, round_no=65, is_day=True, zones={},
             ours=(self.station, defender, miner), player_tasks=(), phase_task="",
         )
         with patch.object(brain, "MEMORY", Memory()):
-            plan = brain._build_plan(turn)
-            self.assertEqual(20, len(plan.wall_sites))
+            commands = {}
+            brain._day_phase(turn, commands)
             self.assertNotIn(miner.unit_id, brain.MEMORY.returning_roles)
 
     def test_worker_returns_inside_before_first_night(self) -> None:
@@ -64,52 +82,49 @@ class DefenseEconomyTests(unittest.TestCase):
             brain._day_phase(turn, commands)
         self.assertEqual("move", commands[worker.unit_id]["action"])
 
-    def test_worker_can_enter_nearly_closed_wall_ring(self) -> None:
-        empty = replace(self.turn, round_no=1, is_day=True, gold=0, zones={},
+    def test_worker_can_enter_through_permanent_rear_opening(self) -> None:
+        empty = replace(self.turn, round_no=131, is_day=True, gold=0, zones={},
                         ours=(self.station,), player_tasks=(), phase_task="")
         with patch.object(brain, "MEMORY", Memory()):
             plan = brain._build_plan(empty)
             gate = brain._gate_position(empty)
-        walls = tuple(
-            replace(self.wall, unit_id=40000 + index, pos=pos, health=1000)
-            for index, pos in enumerate(plan.wall_sites)
-        )
-        dx = -1 if gate.x < self.station.pos.x else 1
-        dy = 1 if gate.y > self.station.pos.y else -1
-        worker = replace(self.worker, pos=Pos(gate.x + dx, gate.y + dy), backpack=())
-        with patch.object(brain, "MEMORY", Memory()):
-            for round_no in range(60, 70):
-                turn = replace(empty, round_no=round_no, ours=(self.station, *walls, worker))
-                if brain._inside_defense(turn, worker):
-                    break
-                commands: dict = {}
-                brain._day_phase(turn, commands)
-                self.assertEqual("move", commands[worker.unit_id]["action"])
-                worker = replace(worker, pos=Pos(**commands[worker.unit_id]["targetPos"][0]))
-            self.assertTrue(brain._inside_defense(turn, worker))
+            walls = tuple(
+                replace(self.wall, unit_id=40000 + index, pos=pos, health=1000)
+                for index, pos in enumerate(plan.wall_sites)
+            )
+            outside = next(
+                pos for pos in brain.neighbours(gate)
+                if pos not in set(plan.wall_sites)
+                and not brain._inside_defense(empty, replace(self.worker, pos=pos))
+            )
+            worker = replace(self.worker, pos=outside, backpack=())
+            turn = replace(empty, ours=(self.station, *walls, worker))
+            path = brain.path_to_any(turn, worker, {brain.MEMORY.repair_gunner_pos})
+            self.assertIsNotNone(path)
 
-    def test_returned_worker_closes_last_gate(self) -> None:
+    def test_no_worker_builds_or_removes_rear_openings(self) -> None:
         empty = replace(self.turn, round_no=1, is_day=True, gold=0, zones={},
                         ours=(self.station,), player_tasks=(), phase_task="")
         with patch.object(brain, "MEMORY", Memory()):
             plan = brain._build_plan(empty)
             gate = brain._gate_position(empty)
+            service = brain._service_gate_position(empty)
+            repair_pos = brain.MEMORY.repair_gunner_pos
         walls = tuple(
             replace(self.wall, unit_id=40000 + index, pos=pos, health=1000)
             for index, pos in enumerate(plan.wall_sites)
         )
-        inner = next(
-            pos for pos in brain._ring(brain.station_footprint(self.station.pos), 1)
-            if max(abs(pos.x - gate.x), abs(pos.y - gate.y)) == 1
-        )
-        worker = replace(self.worker, pos=inner, backpack=("stone",))
+        worker = replace(self.worker, pos=repair_pos, backpack=("stone",))
         turn = replace(empty, round_no=65, ours=(self.station, *walls, worker))
         with patch.object(brain, "MEMORY", Memory()):
             commands: dict = {}
             brain._day_phase(turn, commands)
-        self.assertEqual("build", commands[worker.unit_id]["action"])
-        self.assertEqual("wall", commands[worker.unit_id]["name"])
-        self.assertEqual(gate.dump(), commands[worker.unit_id]["targetPos"][0])
+        self.assertFalse(any(
+            command["action"] in {"build", "remove"}
+            and command.get("targetPos")
+            and Pos.load(command["targetPos"][0]) in {gate, service}
+            for command in commands.values()
+        ))
 
     def test_two_gunners_prioritize_ready_rocket_and_railgun(self) -> None:
         towers = tuple(
@@ -206,7 +221,7 @@ class DefenseEconomyTests(unittest.TestCase):
         self.assertEqual(len(destinations), len(set(destinations)))
         self.assertTrue(destinations)
 
-    def test_incomplete_wall_line_keeps_b_inside_while_pioneer_stages(self) -> None:
+    def test_pre_night_miner_stays_out_while_builder_and_pioneer_stage(self) -> None:
         towers = tuple(replace(tower, pos=pos) for tower, pos in zip(
             self.turn.weapons(), (Pos(9, 25), Pos(9, 23), Pos(9, 24)),
         ))
@@ -236,8 +251,8 @@ class DefenseEconomyTests(unittest.TestCase):
         shop = Pos(6, 5)
         station = replace(self.station, health=600)
         workers = (
-            replace(self.turn.workers()[0], pos=Pos(5, 5), backpack=()),
-            replace(self.turn.workers()[1], pos=Pos(8, 8), backpack=()),
+            replace(self.turn.workers()[0], pos=Pos(8, 8), backpack=()),
+            replace(self.turn.workers()[1], pos=Pos(5, 5), backpack=()),
         )
         turn = replace(
             self.turn, round_no=30, is_day=True, gold=100,
@@ -247,8 +262,8 @@ class DefenseEconomyTests(unittest.TestCase):
         with patch.object(brain, "MEMORY", Memory()):
             commands: dict = {}
             brain._day_phase(turn, commands)
-        self.assertEqual("buy", commands[workers[0].unit_id]["action"])
-        self.assertEqual(STATION_UP_V1, commands[workers[0].unit_id]["name"])
+        self.assertEqual("buy", commands[workers[-1].unit_id]["action"])
+        self.assertEqual(STATION_UP_V1, commands[workers[-1].unit_id]["name"])
 
     def test_no_new_task_is_started_during_night_staging(self) -> None:
         pioneer = self.turn.pioneers()[0]

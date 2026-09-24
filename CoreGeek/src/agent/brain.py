@@ -5,7 +5,7 @@
 import copy
 import logging
 import threading
-from itertools import combinations, permutations
+from itertools import permutations
 from typing import Any, Callable
 
 from . import defense, economy, protocol as P, tasks
@@ -26,7 +26,7 @@ LOGGER = logging.getLogger(__name__)
 
 MEMORY = Memory()
 _DECISION_LOCK = threading.Lock()
-STRATEGY_VERSION = "survival-loop-20260924g"
+STRATEGY_VERSION = "continuous-c-wall-two-operator-20260924"
 UPGRADE_ITEMS = (
     P.STATION_UP_V1, P.STATION_UP_V2, P.WEAPON_UP_V1, P.WEAPON_UP_V2,
     P.WALL_UP_V1, P.WALL_UP_V2,
@@ -36,8 +36,7 @@ UPGRADE_ITEMS = (
 def decide(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
     global MEMORY
     turn = P.Turn.load(payload)
-    if turn.round_no == 1 and MEMORY.current_round > 1:
-        MEMORY = Memory()
+    _reset_match_if_needed(turn)
     MEMORY.current_round = turn.round_no
     MEMORY.note_positions(turn.controllable())
     if turn.round_no == 1:
@@ -75,6 +74,25 @@ def decide(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
     }
 
 
+def _reset_match_if_needed(turn: P.Turn) -> bool:
+    """回合号回退、阵营切换或基地坐标突变都视为新对局。"""
+    global MEMORY
+    station = turn.station()
+    station_pos = station.pos if station is not None else None
+    changed = bool(MEMORY.current_round) and (
+        turn.round_no < MEMORY.current_round
+        or (MEMORY.match_team is not None and MEMORY.match_team != turn.team_type)
+        or (MEMORY.match_station_pos is not None
+            and station_pos is not None
+            and MEMORY.match_station_pos != station_pos)
+    )
+    if changed:
+        MEMORY = Memory()
+    MEMORY.match_team = turn.team_type
+    MEMORY.match_station_pos = station_pos
+    return changed
+
+
 def decide_transactional(
     payload: dict[str, Any],
     publish: Callable[[dict[str, dict[str, Any]]], bool],
@@ -106,23 +124,34 @@ def _night_phase(
     claimed: set[Pos] = set()
     protected: set[int] = set()
     pioneers = turn.pioneers()
-    night_miner = _night_miner(turn)
-    post_wave_safe = _post_wave_safe(turn)
     workers = turn.workers()
-    # 升级券已经花掉了金币，夜幕到来后也必须继续送到建筑旁使用；不能让持券 B 工
-    # 被“夜间矿工”逻辑带离基地，像第 320 回合那样整晚把一级炮留在场上。
-    if any(worker.has(name) for worker in workers for name in UPGRADE_ITEMS):
-        _dispatch_shopping(turn, workers, claimed, commands, allow_returning=True)
-        protected.update(commands)
-    if pioneers:
-        pioneer = pioneers[0]
-        prompt, execute_cmd = tasks.pioneer(
-            turn, pioneer, MEMORY, claimed, commands, allow_new_task=False,
-            allow_treasure=False, departure_round=turn.round_no,
+    night_miner = _night_miner(turn)
+    builder = _builder_operator(turn)
+    post_wave_safe = _post_wave_safe(turn)
+    threats = defense.robots_threatening_us(turn)
+
+    # 进攻阶段不允许任务或购物抢占两个炮手。若白天任务仍未结束，立即结束任务状态，
+    # 保证开拓者可参与轮射；正常情况下白天的 departure_round 会更早完成返防。
+    if not post_wave_safe and pioneers and MEMORY.task_state in tasks.ACTIVE_TASK_STATES:
+        tasks.pioneer(
+            turn, pioneers[0], MEMORY, claimed, commands,
+            allow_new_task=False, allow_treasure=False, departure_round=turn.round_no,
         )
-        if (
-            pioneer.unit_id in commands
-        ):
+
+    # 清场后才释放开拓者做任务。剩余夜间 + 下一整个白天都可用于任务，但必须在
+    # 下一晚前返回固定炮位。这正是对战日志中 round112 开始继续任务的时间窗。
+    if post_wave_safe and pioneers:
+        pioneer = pioneers[0]
+        day_round = (turn.round_no - 1) % P.ROUNDS_PER_DAY + 1
+        next_night = turn.round_no + (P.ROUNDS_PER_DAY - day_round) + P.DAY_ROUNDS + 1
+        departure = next_night - _home_distance(turn, pioneer) - 3
+        available = max(0, departure - turn.round_no)
+        prompt, execute_cmd = tasks.pioneer(
+            turn, pioneer, MEMORY, claimed, commands,
+            allow_new_task=True, allow_treasure=True,
+            departure_round=departure, available_rounds=available,
+        )
+        if pioneer.unit_id in commands:
             protected.add(pioneer.unit_id)
     for role in turn.controllable():
         if role.unit_id in commands:
@@ -131,67 +160,83 @@ def _night_phase(
         if role.has(P.MEDICINE) and role.health < max_hp * 0.45:
             commands[role.unit_id] = use_command(P.MEDICINE)
             protected.add(role.unit_id)
+    # 浪潮出现前可把已经买好的升级券立即送达，避免带着券进入整晚；一旦见过
+    # 本晚机器人，必须等连续清场确认后才允许离开炮位。
+    day = P.day_index(turn.round_no)
+    if (not post_wave_safe and not threats and day not in MEMORY.wave_seen_days
+            and builder is not None and builder.unit_id not in commands
+            and any(builder.has(name) for name in UPGRADE_ITEMS)):
+        _dispatch_shopping(
+            turn, (builder,), claimed, commands, allow_returning=True,
+        )
+        if builder.unit_id in commands:
+            protected.add(builder.unit_id)
     station = turn.station()
-    if station and station.level < 3 and station.health < 1500 * station.level * 0.65:
+    if station and station.level < 3 and station.health < 1500 * station.level * 0.50:
         item = P.STATION_UP_V1 if station.level == 1 else P.STATION_UP_V2
         for worker in turn.workers():
             if worker.unit_id not in commands and worker.has(item) and _inside_defense(turn, worker):
                 _carry_to_use(turn, worker, item, claimed, commands)
                 protected.add(worker.unit_id)
                 break
-    # A 工留在基地附近维护。浪潮中只修身边的危墙，清场后再走动补齐全部残墙。
-    repairers = tuple(
-        worker for worker in turn.workers()
-        if night_miner is None or worker.unit_id != night_miner.unit_id
-    )
-    for worker in repairers:
-        if worker.unit_id not in commands and economy.move_or_repair_wall(
-            turn, worker, claimed, commands, urgent_only=not post_wave_safe, memory=MEMORY,
-        ):
-            protected.add(worker.unit_id)
+    repairers = tuple(worker for worker in workers if builder is not None
+                      and worker.unit_id == builder.unit_id)
     if night_miner is not None and night_miner.unit_id not in commands:
         economy.worker_night_safe(turn, night_miner, MEMORY, claimed, commands)
         protected.add(night_miner.unit_id)
-    # 清场后 A 工先补完墙，再拆后门恢复采矿；B 工从始至终在安全矿区生产。
+
+    # 清场后的调度顺序：危墙保命 > 已购升级券/成长采购 > 普通维修 > 继续生产。
+    # 进攻尚未清空时不提前占用 A 工，它必须与开拓者共同轮射三炮；冷却回合的
+    # 身边维修由 defense.night 统一安排。
     if post_wave_safe:
-        walls_healthy = _walls_healthy(turn)
-        if walls_healthy:
-            _open_gate(turn, claimed, commands, force=True)
-            # 墙修好后再兑现升级；没攒够钱就继续采矿。
-            _dispatch_shopping(turn, repairers, claimed, commands, allow_returning=True)
-        else:
-            # 没有修复包时，A 工先去买包，不能因为手上无包就直接转去采矿。
+        for worker in repairers:
+            if worker.unit_id not in commands and economy.move_or_repair_wall(
+                turn, worker, claimed, commands, urgent_only=True, memory=MEMORY,
+            ):
+                protected.add(worker.unit_id)
+        if builder is not None and builder.unit_id not in commands:
             _dispatch_shopping(
                 turn, repairers, claimed, commands,
-                allow_returning=True, prioritize_repair=True,
+                allow_returning=True, prioritize_repair=False,
             )
-        for worker in turn.workers():
-            if not walls_healthy and worker in repairers:
-                continue
+            if builder.unit_id in commands:
+                protected.add(builder.unit_id)
+        for worker in repairers:
+            if worker.unit_id not in commands and economy.move_or_repair_wall(
+                turn, worker, claimed, commands, urgent_only=False, memory=MEMORY,
+            ):
+                protected.add(worker.unit_id)
+        for worker in repairers:
             if worker.unit_id not in commands:
                 economy.worker_night_safe(turn, worker, MEMORY, claimed, commands)
-    # 开拓者站稳共享位时独自轮射，A 工保持维修待命；若开拓者尚未归位，空闲 A 工
-    # 必须作为炮手兜底，不能让贴着它的冷却完毕炮台整夜不射。
-    if (pioneers and pioneers[0].unit_id not in commands
-            and MEMORY.gunner_pos is not None
-            and pioneers[0].pos == MEMORY.gunner_pos):
-        protected.update(worker.unit_id for worker in turn.workers())
-    defense.night(turn, claimed, commands, protected)
+                protected.add(worker.unit_id)
+
+    # 战斗阶段两名固定炮手轮射三炮；清场后仅未被任务/生产占用的角色参与反击。
+    defense.night(
+        turn, claimed, commands, protected,
+        allow_counterfire=post_wave_safe,
+    )
     return prompt, execute_cmd
 
 
 def _post_wave_safe(turn: P.Turn) -> bool:
-    """本方浪潮清空即进入夜间修墙/生产/反击阶段。"""
+    """见过本方浪潮后连续两回合无威胁，才进入夜间生产阶段。"""
     station = turn.station()
-    return (station is not None and station.health > 0
-            and not defense.robots_threatening_us(turn))
-
-
-def _walls_healthy(turn: P.Turn) -> bool:
-    return all(
-        wall.health >= economy._wall_max_health(wall.level) * economy.HEALTHY_WALL_RATIO
-        for wall in turn.walls()
-    )
+    if station is None or station.health <= 0:
+        return False
+    day = P.day_index(turn.round_no)
+    threats = defense.robots_threatening_us(turn)
+    if threats:
+        MEMORY.wave_seen_days.add(day)
+        MEMORY.wave_clear_streak[day] = 0
+        MEMORY.wave_clear_observed_round[day] = turn.round_no
+        return False
+    if day not in MEMORY.wave_seen_days:
+        return False
+    if MEMORY.wave_clear_observed_round.get(day) != turn.round_no:
+        MEMORY.wave_clear_streak[day] = MEMORY.wave_clear_streak.get(day, 0) + 1
+        MEMORY.wave_clear_observed_round[day] = turn.round_no
+    return MEMORY.wave_clear_streak.get(day, 0) >= 2
 
 
 def _learn_from_feedback(turn: P.Turn) -> None:
@@ -237,6 +282,7 @@ def _day_phase(
     claimed_sites: set[Pos] = set()
     workers = turn.workers()
     night_miner = _night_miner(turn)
+    builder = _builder_operator(turn)
     pioneer_roles = turn.pioneers()
     day_round = (turn.round_no - 1) % P.ROUNDS_PER_DAY + 1
     MEMORY.current_round = turn.round_no
@@ -246,44 +292,26 @@ def _day_phase(
     has_carried_upgrade = any(
         any(worker.has(name) for name in UPGRADE_ITEMS) for worker in workers
     )
-    # 基地濒危、危墙缺修复包、角色濒死时，不受 15 面墙成长门槛限制。
+    # 基地濒危、危墙缺修复包、角色濒死时不受成长阶段限制。
     emergency_want = economy.emergency_shopping_list(turn)
     if emergency_want:
         _dispatch_shopping(
             turn, workers, claimed, commands,
             allow_returning=True, wanted=emergency_want, carried_first=False,
         )
-    # 非紧急的已购升级券随后兑现，B 若持券也不能在夜幕前被先送出基地。
+    # 非紧急的已购升级券随后兑现。购物默认由建造工承担，矿工不因另一名工人
+    # 持券而停止生产。
     if has_carried_upgrade:
         _dispatch_shopping(turn, workers, claimed, commands, allow_returning=True)
 
-    # 有固定出入口的完整昼夜循环：只有防线和封门石头都就绪，才送 B 出城。
-    release_night_miner = (
-        night_miner is not None
-        and _night_miner_release_ready(turn, plan, night_miner)
-    )
-    night_miner_exiting = (
-        release_night_miner and night_miner is not None
-        and _inside_defense(turn, night_miner)
-    )
-    _open_gunner_hatch(turn, claimed, commands)
-    _open_gate(
-        turn, claimed, commands, allow_night_miner_exit=release_night_miner,
-    )
-    if day_round >= 55 and release_night_miner:
-        _send_night_miner_outside(turn, night_miner, claimed, commands)
-    _clear_gate_lane(turn, claimed, commands)
+    # C 形防线背面永久开放，矿工从第 1 回合起就可以出城，绝不再拆墙开门。
+    release_night_miner = night_miner is not None
     for role in turn.controllable():
         if (release_night_miner and night_miner is not None
                 and role.unit_id == night_miner.unit_id):
             MEMORY.returning_roles.discard(role.unit_id)
             continue
         travel = _home_distance(turn, role)
-        if (night_miner_exiting and role.kind == P.WORKER
-                and night_miner is not None and role.unit_id != night_miner.unit_id
-                and not _inside_defense(turn, role)):
-            MEMORY.returning_roles.discard(role.unit_id)
-            continue
         if day_round >= 60 or day_round + travel + 3 >= 70:
             MEMORY.returning_roles.add(role.unit_id)
 
@@ -291,8 +319,8 @@ def _day_phase(
     for worker in workers:
         if worker.unit_id not in commands and worker.has(P.MEDICINE) and worker.health < 132:
             commands[worker.unit_id] = use_command(P.MEDICINE)
-        if (worker.unit_id not in commands
-                and (night_miner is None or worker.unit_id != night_miner.unit_id)):
+        if (worker.unit_id not in commands and builder is not None
+                and worker.unit_id == builder.unit_id):
             economy.move_or_repair_wall(
                 turn, worker, claimed, commands,
                 urgent_only=worker.unit_id in MEMORY.returning_roles,
@@ -303,7 +331,7 @@ def _day_phase(
             _return_home(turn, worker, claimed, commands)
 
     if day_round >= 60:
-        # 夜幕将至：A 工回墙内维护，B 工继续外部现金流，开拓者回共享炮位。
+        # 夜幕将至：建造工回双炮位，矿工继续外部现金流，开拓者回单炮位。
         if (release_night_miner and night_miner is not None
                 and night_miner.unit_id not in commands):
             economy.worker_day(
@@ -314,31 +342,20 @@ def _day_phase(
             worker for worker in workers
             if (not release_night_miner or night_miner is None
                 or worker.unit_id != night_miner.unit_id)
-            and not (night_miner_exiting and not _inside_defense(turn, worker))
         )
         _pre_night_fortify(turn, defenders, plan, claimed, claimed_sites, commands)
     else:
-        built_wall_positions = {wall.pos for wall in turn.walls()}
-        built_walls = sum(pos in built_wall_positions for pos in plan.wall_sites)
-        front_complete = all(pos in built_wall_positions for pos in _front_wall_sites(turn))
-        first_night_quota_met = built_walls >= 15 and front_complete
-        # 第一优先级是三炮与至少 3/4 围墙；达到生存线后才让购物占用工人回合。
-        if first_night_quota_met and not has_carried_upgrade:
+        # 首日把全部 75 金币用于三炮，正常成长采购从第二天开始；此后升级优先于
+        # 扩展墙。危墙和濒危基地已经由上面的 emergency_want 抢占处理。
+        if (P.day_index(turn.round_no) >= 2 and len(turn.weapons()) >= 3
+                and not has_carried_upgrade):
             _dispatch_shopping(turn, workers, claimed, commands)
-        for index, worker in enumerate(workers):
+        for worker in workers:
             if worker.unit_id not in commands and worker.unit_id not in MEMORY.returning_roles:
-                gate = _gate_position(turn)
-                hatch = _gunner_hatch_position(turn)
-                wall_positions = {wall.pos for wall in turn.walls()}
-                missing_closures = sum(
-                    pos is not None and pos not in wall_positions for pos in (hatch, gate)
-                )
                 economy.worker_day(
                     turn, worker, plan, claimed, claimed_sites, MEMORY, commands,
-                    income_only=(len(workers) > 1 and index == len(workers) - 1
-                                 and first_night_quota_met),
-                    force_stone=(index == 0 and day_round >= 45
-                                  and worker.count(P.STONE) < missing_closures),
+                    income_only=(night_miner is not None
+                                 and worker.unit_id == night_miner.unit_id),
                 )
 
     # 开拓者: 任务引擎
@@ -360,14 +377,12 @@ def _day_phase(
         if (pioneer.unit_id in MEMORY.returning_roles and MEMORY.task_state == "idle"
                 and pioneer.unit_id not in commands):
             if len(turn.weapons()) >= 3 and MEMORY.gunner_pos is not None:
-                # 直接以共享炮位为返程终点。若先按“最近基地内格”返城，下一段炮位
-                # 路线又要求从后门绕到舱门，会在门内外形成 A-B-A-B 往返。
+                # 直接以固定炮位为返程终点，避免先回基地再反向走到炮位。
                 _stage_gunners(turn, (pioneer,), claimed, commands)
             else:
                 _return_home(turn, pioneer, claimed, commands)
 
     if day_round >= 60:
-        _vacate_shared_gunner_cell(turn, claimed, commands)
         staging_roles = [
             worker for worker in workers
             if night_miner is None or worker.unit_id != night_miner.unit_id
@@ -420,31 +435,23 @@ def _inside_defense(turn: P.Turn, role: Unit) -> bool:
 
 
 def _night_miner(turn: P.Turn) -> Unit | None:
-    """两名工人中编号较大的 B 工负责昼夜连续采矿；单工局仍必须回防。"""
+    """编号较小的工人固定负责昼夜采矿；另一名工人负责建造、购物和双炮位。"""
     workers = turn.workers()
-    if any(worker.has(name) for worker in workers for name in UPGRADE_ITEMS):
+    if len(workers) < 2:
         return None
-    return workers[-1] if len(workers) >= 2 else None
+    miner = workers[0]
+    # 只有矿工自己误拿了升级券才暂停采矿；建造工持券不能拖停矿工。
+    if any(miner.has(name) for name in UPGRADE_ITEMS):
+        return None
+    return miner
 
 
-def _night_defenders_inside(turn: P.Turn) -> bool:
-    """封门只等待开拓者和 A 工，刻意忽略留在墙外的 B 工。"""
-    miner = _night_miner(turn)
-    return all(
-        _inside_defense(turn, role)
-        for role in turn.controllable()
-        if miner is None or role.unit_id != miner.unit_id
-    )
-
-
-def _night_defenders_ready(turn: P.Turn) -> bool:
-    """三炮成型后必须等开拓者站稳共享炮位，才允许把唯一入口封死。"""
-    if not _night_defenders_inside(turn):
-        return False
-    pioneers = turn.pioneers()
-    if len(turn.weapons()) >= 3 and pioneers and MEMORY.gunner_pos is not None:
-        return pioneers[0].pos == MEMORY.gunner_pos
-    return True
+def _builder_operator(turn: P.Turn) -> Unit | None:
+    """两工人局由编号较大的工人承担建造、采购、维修和双炮轮射。"""
+    workers = turn.workers()
+    if not workers:
+        return None
+    return workers[-1]
 
 
 def _home_distance(turn: P.Turn, role: Unit) -> int:
@@ -478,105 +485,18 @@ def _return_home(turn: P.Turn, role: Unit, claimed: set[Pos], commands: dict) ->
         commands[role.unit_id] = move_command(step)
 
 
-def _send_night_miner_outside(
-    turn: P.Turn, worker: Unit, claimed: set[Pos], commands: dict[int, dict[str, Any]],
-) -> None:
-    """夜幕前把 B 工明确送出后门，避免占住开拓者的三炮共享站位。"""
-    if worker.unit_id in commands:
-        return
-    station = turn.station()
-    gate = _gate_position(turn)
-    if station is None or gate is None:
-        return
-    footprint = station_footprint(station.pos)
-    if min(distance(worker.pos, pos) for pos in footprint) > 2:
-        return
-    outside = {
-        pos for pos in neighbours(gate)
-        if turn.land(pos) and min(distance(pos, cell) for cell in footprint) > 2
-    }
-    step = next_step_to_any(
-        turn, worker, outside, reserved=_move_reserved(worker, claimed),
-    )
-    if step is not None and step not in claimed:
-        claimed.add(step)
-        commands[worker.unit_id] = move_command(step)
-        return
-    # 紧凑三炮会形成单格通道。若 A 正堵在门内，先让 A 临时走到门外，
-    # B 通过后 A 再按 returning_roles 返回封门，避免两人原地互相等待。
-    blockers = [
-        role for role in turn.workers()
-        if role.unit_id != worker.unit_id and role.unit_id not in commands
-        and distance(role.pos, gate) <= 1
-    ]
-    for blocker in blockers:
-        blocker_step = next_step_to_any(
-            turn, blocker, outside, reserved=_move_reserved(blocker, claimed),
-        )
-        if blocker_step is not None and blocker_step not in claimed:
-            claimed.add(blocker_step)
-            commands[blocker.unit_id] = move_command(blocker_step)
-            return
-
-
-def _night_miner_release_ready(
-    turn: P.Turn, plan: economy.Plan, night_miner: Unit,
-) -> bool:
-    """防线未达到首夜生存线时，B 工必须留下补墙并在夜前返城。"""
-    day = P.day_index(turn.round_no)
-    if MEMORY.night_miner_committed_day.get(night_miner.unit_id) == day:
-        return True
-    if len(turn.weapons()) < 3:
-        return False
-    if any(worker.has(name) for worker in turn.workers() for name in UPGRADE_ITEMS):
-        return False
-    wall_positions = {wall.pos for wall in turn.walls()}
-    planned_wall_positions = set(plan.wall_sites)
-    built_walls = len(wall_positions & planned_wall_positions)
-    if built_walls < 15 or not set(_front_wall_sites(turn)) <= wall_positions:
-        return False
-    pioneers = turn.pioneers()
-    if not pioneers or pioneers[0].health < 100 or MEMORY.gunner_pos is None:
-        return False
-    day_round = (turn.round_no - 1) % P.ROUNDS_PER_DAY + 1
-    if distance(pioneers[0].pos, MEMORY.gunner_pos) > max(0, 66 - day_round):
-        return False
-    repairers = [worker for worker in turn.workers()
-                 if worker.unit_id != night_miner.unit_id]
-    wall_positions = {wall.pos for wall in turn.walls()}
-    closures = {
-        pos for pos in (_gate_position(turn), _gunner_hatch_position(turn))
-        if pos is not None and pos not in wall_positions
-    }
-    ready = bool(
-        repairers and any(worker.count(P.STONE) >= len(closures) for worker in repairers)
-    )
-    if ready:
-        MEMORY.night_miner_committed_day[night_miner.unit_id] = day
-    return ready
-
-
 def _gate_position(turn: P.Turn) -> Pos | None:
-    station = turn.station()
-    if station is None:
+    layout = _oriented_defense_layout(turn)
+    if layout is None:
         return None
-    # 任务地图的黄色围墙建造区就是基地足印外半径 2；日志已验证这些格可建。
-    ring = [pos for pos in _ring(station_footprint(station.pos), 2) if turn.land(pos)]
-    if MEMORY.gate_pos not in ring:
-        # 门固定在背敌面。此前按地图中心距离选门，在部分出生点会把缺口留在正面。
-        MEMORY.gate_pos = min(
-            ring, key=lambda pos: (_enemy_projection(turn, pos), pos.x, pos.y), default=None,
-        )
+    MEMORY.gate_pos = layout[5]
+    MEMORY.service_gate_pos = layout[6]
     return MEMORY.gate_pos
 
 
-def _gunner_hatch_position(turn: P.Turn) -> Pos | None:
-    """三炮共享格的临时舱门；它不是工人出入口，夜幕前必须封闭。"""
-    station = turn.station()
-    if station is None:
-        return None
-    ring = set(_ring(station_footprint(station.pos), 2))
-    return MEMORY.gunner_hatch_pos if MEMORY.gunner_hatch_pos in ring else None
+def _service_gate_position(turn: P.Turn) -> Pos | None:
+    _gate_position(turn)
+    return MEMORY.service_gate_pos
 
 
 def _enemy_anchor(turn: P.Turn) -> tuple[float, float]:
@@ -608,16 +528,12 @@ def _enemy_projection(turn: P.Turn, pos: Pos) -> float:
 
 
 def _front_wall_sites(turn: P.Turn) -> tuple[Pos, ...]:
-    station = turn.station()
-    if station is None:
+    layout = _oriented_defense_layout(turn)
+    if layout is None:
         return ()
-    ring = [
-        pos for pos in _ring(station_footprint(station.pos), 2)
-        if turn.land(pos) and MEMORY.build_allowed(pos, WALL)
-    ]
-    ring.sort(key=lambda pos: (-_enemy_projection(turn, pos), pos.x, pos.y))
-    # 20 格围墙圈取最朝敌的 1/3 作为不可欠账的正面墙。
-    return tuple(ring[:max(6, len(ring) // 3)])
+    # 初始 C 墙的前 6 格是一整面迎敌墙，任何侧翼扩展都不能抢在它们之前。
+    return tuple(pos for pos in layout[3][:6]
+                 if turn.land(pos) and MEMORY.build_allowed(pos, WALL))
 
 
 def _move_reserved(role: Unit, claimed: set[Pos]) -> set[Pos]:
@@ -626,149 +542,6 @@ def _move_reserved(role: Unit, claimed: set[Pos]) -> set[Pos]:
             and role.pos != MEMORY.gunner_pos):
         reserved.add(MEMORY.gunner_pos)
     return reserved
-
-
-def _open_gate(
-    turn: P.Turn,
-    claimed: set[Pos],
-    commands: dict,
-    *,
-    force: bool = False,
-    allow_night_miner_exit: bool = True,
-) -> None:
-    gate = _gate_position(turn)
-    day_round = (turn.round_no - 1) % P.ROUNDS_PER_DAY + 1
-    if gate is None or (not force and day_round >= 60 and _night_defenders_ready(turn)):
-        return
-    if not any(wall.pos == gate for wall in turn.walls()):
-        return
-    if not force and day_round >= 55 and not allow_night_miner_exit:
-        # 防线未达标时不为 B 主动拆门；只有墙外防守角色确实需要返城才开。
-        miner = _night_miner(turn)
-        outsiders = any(
-            not _inside_defense(turn, role)
-            for role in turn.controllable()
-            if miner is None or role.unit_id != miner.unit_id
-        )
-        if not outsiders:
-            return
-    miner = _night_miner(turn)
-    workers = [
-        worker for worker in turn.workers()
-        if worker.unit_id not in commands
-        and (miner is None or worker.unit_id != miner.unit_id)
-    ]
-    for worker in sorted(workers, key=lambda role: distance(role.pos, gate)):
-        if distance(worker.pos, gate) <= 1:
-            commands[worker.unit_id] = P.remove_command(gate)
-            LOGGER.info("gate round=%d action=open pos=%s", turn.round_no, gate)
-            return
-        step = next_step_adjacent(turn, worker, gate, reserved=_move_reserved(worker, claimed))
-        if step is not None:
-            claimed.add(step)
-            commands[worker.unit_id] = move_command(step)
-            return
-
-
-def _open_gunner_hatch(
-    turn: P.Turn,
-    claimed: set[Pos],
-    commands: dict[int, dict[str, Any]],
-) -> None:
-    """白天短暂打开炮手舱门；工人日常进出始终走严格背敌面的后门。"""
-    day_round = (turn.round_no - 1) % P.ROUNDS_PER_DAY + 1
-    hatch = _gunner_hatch_position(turn)
-    if (hatch is None or not turn.pioneers() or day_round >= 60
-            or not any(wall.pos == hatch for wall in turn.walls())):
-        return
-    workers = [worker for worker in turn.workers() if worker.unit_id not in commands]
-    for worker in sorted(workers, key=lambda role: distance(role.pos, hatch)):
-        if distance(worker.pos, hatch) <= 1:
-            commands[worker.unit_id] = P.remove_command(hatch)
-            LOGGER.info("gunner_hatch round=%d action=open pos=%s", turn.round_no, hatch)
-            return
-        step = next_step_adjacent(
-            turn, worker, hatch, reserved=_move_reserved(worker, claimed),
-        )
-        if step is not None and step not in claimed:
-            claimed.add(step)
-            commands[worker.unit_id] = move_command(step)
-            return
-
-
-def _clear_gate_lane(turn: P.Turn, claimed: set[Pos], commands: dict) -> None:
-    gate = _gate_position(turn)
-    station = turn.station()
-    if gate is None or station is None:
-        return
-    miner = _night_miner(turn)
-    outsiders = any(
-        not _inside_defense(turn, role)
-        for role in turn.controllable()
-        if miner is None or role.unit_id != miner.unit_id
-    )
-    closing = ((turn.round_no - 1) % P.ROUNDS_PER_DAY + 1 >= 60
-               and not any(w.pos == gate for w in turn.walls()))
-    day_round = (turn.round_no - 1) % P.ROUNDS_PER_DAY + 1
-    if not outsiders and not closing:
-        return
-    inner = _ring(station_footprint(station.pos), 1)
-    for role in turn.controllable():
-        if (role.unit_id in commands or not _inside_defense(turn, role)
-                or distance(role.pos, gate) > 1
-                or role.kind == P.PIONEER
-                and (MEMORY.task_state != "idle" or day_round >= 60)):
-            continue
-        if miner is not None and role.unit_id == miner.unit_id:
-            continue  # B 正沿单格通道出城，不能再被让路逻辑推回基地内。
-        if role.kind == P.PIONEER and role.pos == MEMORY.gunner_pos:
-            continue
-        miner_on_gunner = (
-            miner is not None and role.unit_id == miner.unit_id
-            and role.pos == MEMORY.gunner_pos and bool(turn.pioneers())
-        )
-        if (not outsiders and role.kind == P.WORKER and role.has(P.STONE)
-                and not miner_on_gunner):
-            continue  # 持有石头的工人留在门边封门，其他角色让出施工位。
-        candidates = [pos for pos in inner if distance(role.pos, pos) == 1
-                      and distance(pos, gate) > 1 and turn.land(pos)
-                      and pos != MEMORY.gunner_pos
-                      and pos not in turn.blocked(role) and pos not in claimed]
-        if candidates:
-            step = min(candidates, key=lambda pos: (distance(pos, role.pos), pos.x, pos.y))
-            commands[role.unit_id] = move_command(step)
-            claimed.add(step)
-
-
-def _vacate_shared_gunner_cell(
-    turn: P.Turn,
-    claimed: set[Pos],
-    commands: dict[int, dict[str, Any]],
-) -> None:
-    """共享炮位只留给开拓者，避免 A 工占位后开拓者连续移动失败。"""
-    shared = MEMORY.gunner_pos
-    if shared is None:
-        return
-    blocker = next(
-        (worker for worker in turn.workers()
-         if worker.pos == shared and worker.unit_id not in commands),
-        None,
-    )
-    if blocker is None:
-        return
-    hatch = _gunner_hatch_position(turn)
-    candidates = [
-        pos for pos in neighbours(blocker.pos)
-        if turn.land(pos) and pos not in turn.blocked(blocker) and pos not in claimed
-        and pos != shared
-    ]
-    if hatch in candidates:
-        candidates.remove(hatch)
-        candidates.insert(0, hatch)
-    if candidates:
-        step = candidates[0]
-        claimed.add(step)
-        commands[blocker.unit_id] = move_command(step)
 
 
 def _pre_night_fortify(
@@ -791,6 +564,9 @@ def _pre_night_fortify(
     for worker in workers:
         if worker.unit_id in commands:
             continue
+        # 最后 5 回合完全留给固定炮位归位，不能再因补一面远墙错过夜战。
+        if day_round >= 66:
+            continue
         if not _inside_defense(turn, worker):
             step = next_step_adjacent_to_any(
                 turn, worker, list(footprint), reserved=_move_reserved(worker, claimed),
@@ -798,38 +574,6 @@ def _pre_night_fortify(
             if step is not None and step not in claimed:
                 claimed.add(step)
                 commands[worker.unit_id] = move_command(step)
-            continue
-        closures = [
-            pos for pos in (_gunner_hatch_position(turn), _gate_position(turn))
-            if pos in pending_sites and pos not in claimed_sites
-        ]
-        closure = min(
-            closures,
-            key=lambda pos: (distance(worker.pos, pos) > 1, distance(worker.pos, pos),
-                             pos != _gunner_hatch_position(turn)),
-            default=None,
-        )
-        if (closure is not None and worker.has(P.STONE)
-                and _night_defenders_ready(turn)):
-            if distance(worker.pos, closure) <= 1:
-                commands[worker.unit_id] = P.build_command(closure, WALL)
-                claimed_sites.add(closure)
-                claimed.add(closure)
-            else:
-                # 半径 2 的门从墙内侧半径 1 施工，先封炮手舱门，再封工人后门。
-                closure_stands = {
-                    pos for pos in _ring(footprint, 1)
-                    if turn.land(pos) and pos not in turn.blocked(worker)
-                    and distance(pos, closure) <= 1
-                }
-                step = next_step_to_any(
-                    turn, worker, closure_stands, reserved=_move_reserved(worker, claimed),
-                )
-                if step is not None:
-                    commands[worker.unit_id] = move_command(step)
-                    claimed.add(step)
-            continue
-        if day_round >= 66:
             continue
         # 只建身边的墙，不再离开内圈去采矿或追逐远处建造点。
         if worker.count(P.STONE) == 0:
@@ -869,19 +613,32 @@ def _stage_gunners(
     claimed: set[Pos],
     commands: dict[int, dict[str, Any]],
 ) -> None:
-    """优先把开拓者送到三炮共享站位；开拓者阵亡时再由工人分炮值守。"""
+    """开拓者守单炮位，建造工守可覆盖两炮的位置并兼顾维修。"""
     available_roles = [role for role in roles if role.unit_id not in commands]
     pioneer = next((role for role in available_roles if role.kind == P.PIONEER), None)
-    shared = _shared_gunner_position(turn, pioneer) if pioneer is not None else None
-    if pioneer is not None and shared is not None:
-        if pioneer.pos != shared:
+    assignments: list[tuple[Unit, Pos]] = []
+    if pioneer is not None and MEMORY.gunner_pos is not None:
+        assignments.append((pioneer, MEMORY.gunner_pos))
+    builder = _builder_operator(turn)
+    repairer = next(
+        (role for role in available_roles
+         if builder is not None and role.unit_id == builder.unit_id),
+        None,
+    )
+    if repairer is not None and MEMORY.repair_gunner_pos is not None:
+        assignments.append((repairer, MEMORY.repair_gunner_pos))
+    for role, target in assignments:
+        if role.pos != target:
             step = next_step_to_any(
-                turn, pioneer, {shared}, reserved=_move_reserved(pioneer, claimed),
+                turn, role, {target}, reserved=_move_reserved(role, claimed),
             )
             if step is not None and step not in claimed:
                 claimed.add(step)
-                commands[pioneer.unit_id] = move_command(step)
+                commands[role.unit_id] = move_command(step)
+    if assignments:
         return
+
+    # 角色或缓存不完整时仍按炮台就近值守，不能因为布局记忆丢失而整夜不开火。
     towers = sorted(
         turn.weapons(),
         key=lambda tower: ({P.ROCKET: 0, P.RAILGUN: 1, P.GATLING: 2}.get(tower.kind, 3),
@@ -908,26 +665,6 @@ def _stage_gunners(
         if step is not None and step not in claimed:
             claimed.add(step)
             commands[worker.unit_id] = move_command(step)
-
-
-def _shared_gunner_position(turn: P.Turn, moving: Unit | None = None) -> Pos | None:
-    towers = turn.weapons()
-    if not towers:
-        return MEMORY.gunner_pos
-    blocked = turn.blocked(moving) if moving is not None else turn.occupied_cells()
-    candidates = {
-        pos for pos in neighbours(towers[0].pos)
-        if turn.land(pos) and (moving is not None and pos == moving.pos or pos not in blocked)
-        and all(distance(pos, tower.pos) <= 1 for tower in towers)
-    }
-    if MEMORY.gunner_pos in candidates:
-        return MEMORY.gunner_pos
-    station = turn.station()
-    if station is None or not candidates:
-        return None
-    return min(candidates, key=lambda pos: (
-        min(distance(pos, cell) for cell in station_footprint(station.pos)), pos.x, pos.y,
-    ))
 
 
 def _dispatch_shopping(
@@ -968,8 +705,12 @@ def _dispatch_shopping(
     if shop is None:
         return
     for name, num in want:
-        # 已有人背这个物品且量足够 -> 跳过购买, 直接由持有者去用
-        holder = next((w for w in workers if w.count(name) >= num), None)
+        # 升级券已有持有者时直接交付；修复包等可叠加消耗品的 num 表示“还需购买
+        # 的数量”，不能因为背包已有 1 个就错误跳过补库存。
+        holder = next(
+            (w for w in workers if name in carried_upgrades and w.count(name) >= num),
+            None,
+        )
         if holder is not None:
             if holder.unit_id in commands:
                 return
@@ -984,7 +725,8 @@ def _dispatch_shopping(
             P.WEAPON_UP_V1, P.WEAPON_UP_V2, P.WALL_UP_V1, P.WALL_UP_V2,
         }
         buyers = (sorted(workers, key=lambda role: role.health) if name == P.MEDICINE
-                  else list(workers) if name in maintenance else list(reversed(workers)))
+                  else list(reversed(workers)) if name in maintenance
+                  else list(reversed(workers)))
         buyer = next(
             (
                 w for w in buyers
@@ -1063,7 +805,17 @@ def _carry_to_use(
                 commands[holder.unit_id] = move_command(step)
     elif name.startswith("WallUpgrade"):
         wanted_level = 1 if name == P.WALL_UP_V1 else 2
-        wall = next((w for w in turn.walls() if w.level == wanted_level), None)
+        front = set(_front_wall_sites(turn))
+        wall = min(
+            (w for w in turn.walls() if w.level == wanted_level),
+            key=lambda item: (
+                item.pos not in front,
+                item.health / economy._wall_max_health(item.level),
+                -_enemy_projection(turn, item.pos),
+                item.unit_id,
+            ),
+            default=None,
+        )
         if wall is None:
             return
         if distance(holder.pos, wall.pos) <= 1:
@@ -1105,116 +857,159 @@ def _build_plan(turn: P.Turn) -> economy.Plan:
     station = turn.station()
     if station is None:
         return economy.Plan()
-    footprint = station_footprint(station.pos)
-    rear_gate = _gate_position(turn)
+    layout = _oriented_defense_layout(turn)
+    if layout is None:
+        return economy.Plan()
+    target_towers, primary, repair, initial_walls, expanded_walls, gate, service_gate = layout
+    MEMORY.gate_pos = gate
+    MEMORY.service_gate_pos = service_gate
+    MEMORY.gunner_pos = primary
+    MEMORY.repair_gunner_pos = repair
+    MEMORY.tower_layout = target_towers
 
-    # 武器只能建在任务地图蓝区：日志验证为基地足印外半径 1。
+    # 三座火箭全部位于背敌侧。它们离迎敌墙最远也只有 4~5 格，一级射程即可
+    # 覆盖整条正面；两处固定炮位分别覆盖 1 炮和 2 炮。
     occupied = turn.occupied_cells() - {role.pos for role in turn.controllable()}
-    sites = sorted(
-        (
-            pos
-            for pos in _ring(footprint, radius=1)
-            if turn.land(pos) and pos not in occupied
-        ),
-        key=lambda p: (-_enemy_projection(turn, p), p.x, p.y),
-    )
-    chosen_sites: list[Pos] = []
-    chosen_kinds: list[str] = []
     needed = max(0, 3 - len(turn.weapons()))
     existing = {tower.pos for tower in turn.weapons()}
-    cached = [pos for pos in MEMORY.tower_layout if pos not in existing]
-    if needed and (len(cached) != needed or any(
-        pos in occupied or not turn.land(pos) or not MEMORY.build_allowed(pos, P.ROCKET)
-        for pos in cached
-    )):
-        candidates = [pos for pos in sites if MEMORY.build_allowed(pos, P.ROCKET)]
-        layouts: list[
-            tuple[tuple[float, float, float, int], tuple[Pos, ...], Pos, Pos]
-        ] = []
-        inner = {pos for pos in _ring(footprint, 1) if turn.land(pos) and pos not in occupied}
-        wall_ring = {
-            pos for pos in _ring(footprint, 2)
-            if turn.land(pos) and MEMORY.build_allowed(pos, WALL)
-        }
-        protected_front = set(sorted(
-            wall_ring,
-            key=lambda pos: (-_enemy_projection(turn, pos), pos.x, pos.y),
-        )[:max(6, len(wall_ring) // 3)])
-        for chosen in combinations(candidates, needed):
-            towers = existing | set(chosen)
-            stands = inner - set(chosen)
-            if len(towers) != 3 or not stands:
-                continue
-            shared_cells = [
-                pos for pos in stands
-                if all(distance(pos, tower) <= 1 for tower in towers)
-            ]
-            for shared in shared_cells:
-                # 单共享炮位会被基地和三座炮围成口袋，因此另设仅供开拓者使用的
-                # 临时舱门；工人的正式出入口仍固定在严格背敌面。
-                hatches = list(wall_ring)
-                usable_hatches = [
-                    hatch for hatch in hatches
-                    if hatch != rear_gate
-                    and hatch not in protected_front
-                    and distance(hatch, shared) <= 1
-                    and any(
-                        distance(inner_pos, hatch) <= 1
-                        for inner_pos in stands - {shared}
-                    )
-                ]
-                if not usable_hatches:
-                    continue
-                hatch = min(
-                    usable_hatches,
-                    key=lambda pos: (_enemy_projection(turn, pos), pos.x, pos.y),
-                )
-                projections = [_enemy_projection(turn, pos) for pos in towers]
-                score = (
-                    min(projections),
-                    sum(projections),
-                    -_enemy_projection(turn, hatch),
-                    -distance(shared, hatch),
-                )
-                layouts.append((score, chosen, shared, hatch))
-        if layouts:
-            _, selected, shared, hatch = max(layouts, key=lambda item: item[0])
-            cached = list(selected)
-            MEMORY.tower_layout = (
-                tuple(sorted(existing, key=lambda pos: (pos.x, pos.y))) + tuple(cached)
-            )
-            MEMORY.gunner_pos = shared
-            MEMORY.gunner_hatch_pos = hatch
-        else:
-            cached = candidates[:needed]
-            MEMORY.tower_layout = tuple(existing) + tuple(cached)
-    sites = cached if needed else sites
-    for kind in economy.TOWER_LOADOUT[:needed]:
-        site = next(
-            (p for p in sites if p not in chosen_sites and MEMORY.build_allowed(p, kind)),
-            None,
-        )
-        if site is not None:
-            chosen_sites.append(site)
-            chosen_kinds.append(kind)
-    tower_sites = tuple(chosen_sites)
-    tower_kinds = tuple(chosen_kinds)
+    candidates = [
+        pos for pos in target_towers
+        if pos not in existing and pos not in occupied
+        and turn.land(pos) and MEMORY.build_allowed(pos, P.ROCKET)
+    ][:needed]
+    tower_sites = tuple(candidates)
+    tower_kinds = tuple(economy.TOWER_LOADOUT[:len(tower_sites)])
 
-    # 围墙只能建在任务地图黄区：日志验证为基地足印外半径 2。
-    wall_sites_list = [
-        pos
-        for pos in _ring(footprint, radius=2)
+    # 先完成 10 面连续 C 墙。外圈扩到 18 面是后期富余项：不能在第二天
+    # 继续抢占建造工，拖慢三炮升级、基地回血保险和正面墙升级。两个背面
+    # 通道始终排除在计划之外，任何回合都不会生成 remove 指令。
+    planned_walls = expanded_walls if _expansion_ready(
+        turn, initial_walls[:6],
+    ) else initial_walls
+    wall_sites = tuple(
+        pos for pos in planned_walls
         if turn.land(pos) and MEMORY.build_allowed(pos, WALL)
-    ]
-    # 严格按敌方方向排序，首夜先完成正面，背敌面的门最后封。
-    wall_sites_list.sort(key=lambda p: (-_enemy_projection(turn, p), p.x, p.y))
-    day_round = (turn.round_no - 1) % P.ROUNDS_PER_DAY + 1
-    gate = _gate_position(turn)
-    hatch = _gunner_hatch_position(turn)
-    if not (day_round >= 60 and _night_defenders_ready(turn)):
-        wall_sites_list = [pos for pos in wall_sites_list if pos not in {gate, hatch}]
-    wall_sites = tuple(wall_sites_list)
-    return economy.Plan(tower_sites=tower_sites, tower_kinds=tower_kinds, wall_sites=wall_sites)
+    )
+    return economy.Plan(
+        tower_sites=tower_sites, tower_kinds=tower_kinds, wall_sites=wall_sites,
+    )
+
+
+def _expansion_ready(turn: P.Turn, front_sites: tuple[Pos, ...]) -> bool:
+    """只在核心防线已经稳定时扩建外圈。
+
+    门槛来自实战日志中的闭环：第四天、三门三级炮、正面六墙二级且健康，
+    并保留 250 金币应急。不满足时建造工转去赚钱、修墙和送升级券。
+    """
+    if P.day_index(turn.round_no) < 4 or turn.gold < 250:
+        return False
+    weapons = sorted(turn.weapons(), key=lambda weapon: weapon.level, reverse=True)
+    if len(weapons) < 3 or any(weapon.level < 3 for weapon in weapons[:3]):
+        return False
+    if any(
+        weapon.health < economy._wall_max_health(weapon.level) * economy.HEALTHY_WALL_RATIO
+        for weapon in weapons[:3]
+    ):
+        return False
+    walls_by_pos = {wall.pos: wall for wall in turn.walls()}
+    return all(
+        (wall := walls_by_pos.get(pos)) is not None
+        and wall.level >= 2
+        and wall.health >= economy._wall_max_health(wall.level) * economy.HEALTHY_WALL_RATIO
+        for pos in front_sites
+    )
+
+
+def _oriented_defense_layout(
+    turn: P.Turn,
+) -> tuple[
+    tuple[Pos, ...], Pos, Pos, tuple[Pos, ...], tuple[Pos, ...], Pos, Pos
+] | None:
+    """生成可镜像到四角的背面三炮 + 连续 C 墙布局。"""
+    station = turn.station()
+    if station is None:
+        return None
+    footprint = station_footprint(station.pos)
+    xs = [pos.x for pos in footprint]
+    ys = [pos.y for pos in footprint]
+    xmin, xmax = min(xs), max(xs)
+    ymin, ymax = min(ys), max(ys)
+    base_x, base_y = _base_center(turn)
+    enemy_x, enemy_y = _enemy_anchor(turn)
+    delta_x, delta_y = enemy_x - base_x, enemy_y - base_y
+
+    outer = set(_ring(footprint, 2))
+    if abs(delta_x) >= abs(delta_y):
+        front_sign = 1 if delta_x >= 0 else -1
+        secondary_sign = 1 if delta_y > 0 else -1
+        front_x = xmax + 2 if front_sign > 0 else xmin - 2
+        rear_x = xmin - 1 if front_sign > 0 else xmax + 1
+        operator_x = xmin if front_sign > 0 else xmax
+        outer_rear_x = xmin - 2 if front_sign > 0 else xmax + 2
+
+        if secondary_sign < 0:
+            tower_axis = (ymax + 1, ymin, ymin - 1)
+            primary_axis, repair_axis, omitted_axis = ymax + 1, ymin - 1, ymax
+        else:
+            tower_axis = (ymin - 1, ymax, ymax + 1)
+            primary_axis, repair_axis, omitted_axis = ymin - 1, ymax + 1, ymin
+        towers = tuple(Pos(rear_x, value) for value in tower_axis)
+        primary = Pos(operator_x, primary_axis)
+        repair = Pos(operator_x, repair_axis)
+        gate = Pos(outer_rear_x, omitted_axis)
+        service_gate = Pos(outer_rear_x, repair_axis)
+
+        center = (ymin + ymax) / 2
+        front_wall = sorted(
+            (Pos(front_x, value) for value in range(ymin - 2, ymax + 3)),
+            key=lambda pos: (abs(pos.y - center), -secondary_sign * pos.y),
+        )
+        inward = (front_x - front_sign, front_x - 2 * front_sign)
+        flank_wall = tuple(
+            Pos(value, edge)
+            for value in inward
+            for edge in (ymax + 2, ymin - 2)
+        )
+    else:
+        front_sign = 1 if delta_y >= 0 else -1
+        secondary_sign = 1 if delta_x > 0 else -1
+        front_y = ymax + 2 if front_sign > 0 else ymin - 2
+        rear_y = ymin - 1 if front_sign > 0 else ymax + 1
+        operator_y = ymin if front_sign > 0 else ymax
+        outer_rear_y = ymin - 2 if front_sign > 0 else ymax + 2
+
+        if secondary_sign < 0:
+            tower_axis = (xmax + 1, xmin, xmin - 1)
+            primary_axis, repair_axis, omitted_axis = xmax + 1, xmin - 1, xmax
+        else:
+            tower_axis = (xmin - 1, xmax, xmax + 1)
+            primary_axis, repair_axis, omitted_axis = xmin - 1, xmax + 1, xmin
+        towers = tuple(Pos(value, rear_y) for value in tower_axis)
+        primary = Pos(primary_axis, operator_y)
+        repair = Pos(repair_axis, operator_y)
+        gate = Pos(omitted_axis, outer_rear_y)
+        service_gate = Pos(repair_axis, outer_rear_y)
+
+        center = (xmin + xmax) / 2
+        front_wall = sorted(
+            (Pos(value, front_y) for value in range(xmin - 2, xmax + 3)),
+            key=lambda pos: (abs(pos.x - center), -secondary_sign * pos.x),
+        )
+        inward = (front_y - front_sign, front_y - 2 * front_sign)
+        flank_wall = tuple(
+            Pos(edge, value)
+            for value in inward
+            for edge in (xmax + 2, xmin - 2)
+        )
+
+    initial = tuple(front_wall) + flank_wall
+    gaps = {gate, service_gate}
+    remainder = sorted(
+        outer - set(initial) - gaps,
+        key=lambda pos: (-_enemy_projection(turn, pos), pos.x, pos.y),
+    )
+    expanded = initial + tuple(remainder)
+    return towers, primary, repair, initial, expanded, gate, service_gate
 
 
 def _ring(footprint: tuple[Pos, ...], radius: int) -> list[Pos]:
@@ -1273,8 +1068,6 @@ def _log_defense_snapshot(turn: P.Turn, commands: dict[int, dict[str, Any]]) -> 
 def _resolve_command_conflicts(turn: P.Turn, commands: dict[int, dict[str, Any]]) -> None:
     """最后检查跨模块的移动争格、换位、建筑占位及重复控制角色。"""
     controllers: set[int] = set()
-    destinations: set[Pos] = set()
-    role_positions = {role.pos for role in turn.controllable()}
     for key, command in list(commands.items()):
         if command.get("action") == "attack":
             role_id = int(command["controllerId"])
@@ -1282,18 +1075,51 @@ def _resolve_command_conflicts(turn: P.Turn, commands: dict[int, dict[str, Any]]
                 commands.pop(key)
             else:
                 controllers.add(role_id)
-        elif command.get("action") == "move":
-            pos = Pos.load(command["targetPos"][0])
-            role_id = int(key)
-            if MEMORY.would_oscillate(role_id, pos):
-                LOGGER.warning("oscillation stopped round=%d role=%d target=%s",
-                               turn.round_no, role_id, pos)
-                MEMORY.note_move_result(role_id, pos, False)
-                commands.pop(key)
-            elif pos in destinations or pos in role_positions:
-                commands.pop(key)
-            else:
-                destinations.add(pos)
+    # 先去掉振荡和多人争抢同一终点，再允许“前车已经驶离”的跟随移动。
+    # 旧逻辑把所有当前角色格都视为永久占用，狭窄后门中会把合法队列截断，继而
+    # 触发下一回合反向寻路，形成 A-B-A-B 往返。
+    moves: dict[int, Pos] = {}
+    destinations: dict[Pos, int] = {}
     for key, command in list(commands.items()):
-        if command.get("action") == "build" and Pos.load(command["targetPos"][0]) in destinations:
+        if command.get("action") != "move":
+            continue
+        role_id = int(key)
+        pos = Pos.load(command["targetPos"][0])
+        if MEMORY.would_oscillate(role_id, pos):
+            LOGGER.warning("oscillation stopped round=%d role=%d target=%s",
+                           turn.round_no, role_id, pos)
+            MEMORY.note_move_result(role_id, pos, False)
+            commands.pop(key)
+            continue
+        if pos in destinations:
+            commands.pop(key)
+            continue
+        destinations[pos] = role_id
+        moves[role_id] = pos
+
+    occupants = {role.pos: role.unit_id for role in turn.controllable()}
+    changed = True
+    while changed:
+        changed = False
+        for role_id, destination in list(moves.items()):
+            occupant = occupants.get(destination)
+            if occupant is None or occupant == role_id:
+                continue
+            occupant_destination = moves.get(occupant)
+            # 静止占位、直接换位和已被删除的移动都不安全；向正在离开的角色后方
+            # 跟随则保留，使两名角色可以在窄通道中同向前进。
+            blocked = occupant_destination is None
+            if occupant_destination == next(
+                (role.pos for role in turn.controllable() if role.unit_id == role_id),
+                None,
+            ):
+                blocked = True
+            if blocked:
+                commands.pop(role_id, None)
+                moves.pop(role_id, None)
+                changed = True
+    active_destinations = set(moves.values())
+    for key, command in list(commands.items()):
+        if (command.get("action") == "build"
+                and Pos.load(command["targetPos"][0]) in active_destinations):
             commands.pop(key)

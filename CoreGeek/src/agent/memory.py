@@ -41,6 +41,9 @@ class Memory:
     build_retry_after: dict[tuple[int, int, str], int] = field(default_factory=dict)
     build_failures: dict[tuple[int, int, str], int] = field(default_factory=dict)
     current_round: int = 0
+    # 防止判题器不重启进程时，上一场的任务/建造记忆污染新半场。
+    match_team: str | None = None
+    match_station_pos: Pos | None = None
     worker_modes: dict[int, str] = field(default_factory=dict)
     # 工人的具体目标跨回合锁定，避免每回合重选矿点/墙位造成来回横跳。
     worker_targets: dict[int, Pos] = field(default_factory=dict)
@@ -48,18 +51,21 @@ class Memory:
     # 夜间撤退必须跨回合保持；否则矿点选择与一步逃跑会互相覆盖，形成来回横跳。
     worker_retreat_until: dict[int, int] = field(default_factory=dict)
     worker_safe_streak: dict[int, int] = field(default_factory=dict)
-    # 一旦本日开始送 B 出城，就保持到出城完成，避免临近夜幕重新判定后掉头。
-    night_miner_committed_day: dict[int, int] = field(default_factory=dict)
     # 被服务器拒绝的移动目标短期拉黑；否则相同状态会无限重发同一步。
     failed_move_until: dict[tuple[int, int, int], int] = field(default_factory=dict)
     position_history: dict[int, list[Pos]] = field(default_factory=dict)
     returning_roles: set[int] = field(default_factory=set)
     gate_pos: Pos | None = None
-    # 三炮共享炮位会被基地和炮台围成口袋，需要一处只供开拓者进出的临时舱门。
-    # gate_pos 始终是背敌面的工人后门，不能再被炮位布局覆盖。
-    gunner_hatch_pos: Pos | None = None
+    service_gate_pos: Pos | None = None
+    # C 形防线在背敌面永久保留两处通道；任何角色通行都不再拆墙。
     tower_layout: tuple[Pos, ...] = ()
+    # 开拓者守单炮位；建造工守双炮位并在火箭冷却时维修。
     gunner_pos: Pos | None = None
+    repair_gunner_pos: Pos | None = None
+    # 必须先见到本方浪潮，再连续两回合观察不到威胁，才进入 NIGHT_WORK。
+    wave_seen_days: set[int] = field(default_factory=set)
+    wave_clear_streak: dict[int, int] = field(default_factory=dict)
+    wave_clear_observed_round: dict[int, int] = field(default_factory=dict)
     task_outcomes: dict[Pos, tuple[int, int]] = field(default_factory=dict)
     # 锁定正在赶往的自进化任务点，避免逐回合重选造成左右横跳。
     task_approach_point: Pos | None = None

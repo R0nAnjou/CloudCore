@@ -50,6 +50,7 @@ def pioneer(
     allow_new_task: bool = True,
     allow_treasure: bool = True,
     departure_round: int = 0,
+    available_rounds: int | None = None,
 ) -> tuple[str, str]:
     """开拓者状态机，返回本回合的 (prompt, executeCmd)。"""
     memory.task_departure_round = departure_round
@@ -86,8 +87,10 @@ def pioneer(
     # prompt 与角色动作可同回合提交，不因赶往任务点而饿死宝藏推理链路。
     inference_prompt = _maybe_request_treasure_inference(turn, memory) if allow_treasure else ""
 
-    if allow_new_task and turn.is_day:
-        target = _pick_task_point(turn, pioneer_role, memory)
+    if allow_new_task and (turn.is_day or available_rounds is not None):
+        target = _pick_task_point(
+            turn, pioneer_role, memory, available_rounds=available_rounds,
+        )
         if target is not None:
             if distance(pioneer_role.pos, target) <= 1:
                 commands[pioneer_role.unit_id] = accept_task_command()
@@ -188,6 +191,8 @@ def _pick_task_point(
     turn: P.Turn,
     role: Unit | None = None,
     memory: Memory | None = None,
+    *,
+    available_rounds: int | None = None,
 ) -> Pos | None:
     ready = [task for task in turn.player_tasks if task.is_valid and task.cold_down == 0]
     if not ready:
@@ -214,9 +219,12 @@ def _pick_task_point(
         if task.timeout_rounds and task.timeout_rounds < MIN_TASK_TIMEOUT:
             continue
         phase_round = (turn.round_no - 1) % P.ROUNDS_PER_DAY + 1
-        if not turn.is_day:
-            continue
-        rounds_left = P.DAY_ROUNDS - phase_round
+        if available_rounds is None:
+            if not turn.is_day:
+                continue
+            rounds_left = P.DAY_ROUNDS - phase_round
+        else:
+            rounds_left = max(0, available_rounds)
         if travel + duration + return_steps + 3 > rounds_left:
             continue
         wins, attempts = memory.task_outcomes.get(task.position, (0, 0)) if memory else (0, 0)
