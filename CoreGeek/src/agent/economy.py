@@ -3,7 +3,7 @@
 设计要点:
 - 工人以"收益 = 价格 / 往返步数"选矿, 并结合新闻推断的停产预期(推理类任务联动)。
 - 达到批量阈值或背包将满时去小贩处贩卖(每回合仅一个动作)。
-- 金币支出优先级: 基地升级券 > 武器升级券 > 围墙升级/修复; 常备少量石头。
+- 金币支出优先级: 三炮最低核心 > 迎敌中央双墙三级 > 基地保险 > 其余成长。
 """
 from dataclasses import dataclass
 from typing import Any
@@ -55,6 +55,73 @@ class Plan:
     tower_sites: tuple[Pos, ...] = ()
     tower_kinds: tuple[str, ...] = ()
     wall_sites: tuple[Pos, ...] = ()
+
+
+def central_front_walls(turn: P.Turn) -> tuple[Unit, ...]:
+    """返回迎敌正面最中间的两面已建围墙。
+
+    先按敌方所在的主方向取最外侧墙线，再按与基地中心的横向偏移取中间两格。
+    这与四个出生角的镜像 C 墙布局兼容。
+    """
+    station = turn.station()
+    walls = list(turn.walls())
+    if station is None or len(walls) < 2:
+        return ()
+    footprint = station_footprint(station.pos)
+    base_x = sum(pos.x for pos in footprint) / len(footprint)
+    base_y = sum(pos.y for pos in footprint) / len(footprint)
+    enemy_station = next(
+        (role for role in turn.enemy_roles if role.kind == P.STATION), None,
+    )
+    if enemy_station is not None:
+        enemy_cells = station_footprint(enemy_station.pos)
+        enemy_x = sum(pos.x for pos in enemy_cells) / len(enemy_cells)
+        enemy_y = sum(pos.y for pos in enemy_cells) / len(enemy_cells)
+    elif turn.enemy_roles:
+        enemy_x = sum(role.pos.x for role in turn.enemy_roles) / len(turn.enemy_roles)
+        enemy_y = sum(role.pos.y for role in turn.enemy_roles) / len(turn.enemy_roles)
+    else:
+        enemy_x, enemy_y = turn.width / 2, turn.height / 2
+    delta_x, delta_y = enemy_x - base_x, enemy_y - base_y
+    if abs(delta_x) >= abs(delta_y):
+        edge = (max(wall.pos.x for wall in walls) if delta_x >= 0
+                else min(wall.pos.x for wall in walls))
+        front = [wall for wall in walls if wall.pos.x == edge]
+        front.sort(key=lambda wall: (abs(wall.pos.y - base_y), wall.pos.y, wall.unit_id))
+    else:
+        edge = (max(wall.pos.y for wall in walls) if delta_y >= 0
+                else min(wall.pos.y for wall in walls))
+        front = [wall for wall in walls if wall.pos.y == edge]
+        front.sort(key=lambda wall: (abs(wall.pos.x - base_x), wall.pos.x, wall.unit_id))
+    return tuple(front[:2]) if len(front) >= 2 else ()
+
+
+def central_wall_upgrade_need(turn: P.Turn) -> tuple[str, int] | None:
+    """中央双墙先同步升二级，再同步升三级。"""
+    central = central_front_walls(turn)
+    if len(central) < 2:
+        return None
+    level1 = sum(wall.level == 1 for wall in central)
+    if level1:
+        return WALL_UP_V1, level1
+    level2 = sum(wall.level == 2 for wall in central)
+    if level2:
+        return WALL_UP_V2, level2
+    return None
+
+
+def central_wall_upgrade_reserve(turn: P.Turn) -> int:
+    """第三夜前中央双墙到三级还需预留的金币。"""
+    central = central_front_walls(turn)
+    if len(central) < 2:
+        return 0
+    need_v1 = sum(wall.level == 1 for wall in central)
+    need_v2 = sum(wall.level <= 2 for wall in central)
+    held_v1 = sum(role.count(WALL_UP_V1) for role in turn.controllable())
+    held_v2 = sum(role.count(WALL_UP_V2) for role in turn.controllable())
+    price_v1 = turn.shop_prices.get(WALL_UP_V1, 20)
+    price_v2 = turn.shop_prices.get(WALL_UP_V2, 30)
+    return max(0, need_v1 - held_v1) * price_v1 + max(0, need_v2 - held_v2) * price_v2
 
 
 def worker_day(
@@ -487,7 +554,7 @@ def _move_reserved(memory: Memory, worker: Unit, claimed: set[Pos]) -> set[Pos]:
 
 
 def shopping_list(turn: P.Turn) -> list[tuple[str, int]]:
-    """先形成 3-2-1 火力核心，再买基地保险，随后把三炮补到三级。"""
+    """主火箭三级后，第三夜前锁定中央双墙三级。"""
     items: list[tuple[str, int]] = []
     gold = turn.gold
     station = turn.station()
@@ -523,17 +590,34 @@ def shopping_list(turn: P.Turn) -> list[tuple[str, int]]:
 
     weapons = turn.weapons()
     levels = sorted((weapon.level for weapon in weapons), reverse=True)
-    core_battery = len(levels) >= 3 and levels[0] >= 3 and levels[1] >= 2
+    fire_anchor = len(levels) >= 3 and levels[0] >= 3
+    core_battery = fire_anchor and levels[1] >= 2
     station_insurance = (
-        station is not None and station.level == 1
-        and station.health < 1500 * 0.90 and core_battery
+        station is not None and station.level < 3
+        and station.health < 1500 * station.level * 0.90 and core_battery
+    )
+    central_need = central_wall_upgrade_need(turn)
+    fortify_centre = (
+        P.day_index(turn.round_no) >= 2 and fire_anchor and central_need is not None
     )
 
-    # 对战日志中的关键顺序：2-1-1 -> 3-1-1 -> 3-2-1。达到该核心后，
-    # 若基地已经受损则插入一张基地升级券作为回血保险，再继续补齐三门三级炮。
+    # 真实路径：1-1-1 -> 2-1-1 -> 3-1-1，然后立即冻结其他普通成长，
+    # 先把中央双墙做到 2-2，再做到 3-3；之后才继续到 3-2-1。
     if len(weapons) >= 3 and not urgent_station:
-        if station_insurance:
-            add(STATION_UP_V1, 100)
+        if not fire_anchor and levels[0] < 2:
+            add(WEAPON_UP_V1, 100)
+        elif not fire_anchor and levels[0] < 3:
+            add(WEAPON_UP_V2, 150)
+        elif fortify_centre and central_need is not None:
+            name, quantity = central_need
+            add(name, 20 if name == WALL_UP_V1 else 30, target=quantity)
+        elif not core_battery and levels[1] < 2:
+            add(WEAPON_UP_V1, 100)
+        elif station_insurance:
+            add(
+                STATION_UP_V1 if station and station.level == 1 else STATION_UP_V2,
+                100 if station and station.level == 1 else 150,
+            )
         elif any(weapon.level == 1 for weapon in weapons):
             add(WEAPON_UP_V1, 100)
         elif any(weapon.level == 2 for weapon in weapons):
@@ -599,6 +683,26 @@ def emergency_shopping_list(turn: P.Turn) -> list[tuple[str, int]]:
             for role in turn.controllable())
             and not any(role.has(P.MEDICINE) for role in turn.controllable())):
         add(P.MEDICINE, 10)
+
+    # 第三天最后 20 回合仍未完成中央双墙三级时，将其提升为
+    # 夜战应急采购，突破普通购物在第 60 回合后停止的限制。
+    day_round = (turn.round_no - 1) % P.ROUNDS_PER_DAY + 1
+    levels = sorted((weapon.level for weapon in turn.weapons()), reverse=True)
+    fire_anchor = len(levels) >= 3 and levels[0] >= 3
+    central_need = central_wall_upgrade_need(turn)
+    if (P.day_index(turn.round_no) == 3 and day_round >= 50
+            and fire_anchor and central_need is not None):
+        name, quantity = central_need
+        price = turn.shop_prices.get(name, 20 if name == WALL_UP_V1 else 30)
+        carried = sum(role.count(name) for role in turn.controllable())
+        missing = max(0, quantity - carried)
+        affordable = min(missing, gold // max(1, price))
+        if affordable:
+            urgent_station = any(item in {STATION_UP_V1, STATION_UP_V2} for item, _ in items)
+            if urgent_station:
+                items.append((name, affordable))
+            else:
+                items.insert(0, (name, affordable))
     return items
 
 

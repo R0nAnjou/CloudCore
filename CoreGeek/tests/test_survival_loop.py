@@ -581,6 +581,111 @@ class SurvivalLoopTests(unittest.TestCase):
         turn = replace(turn, ours=(replace(self.station, health=640), *rockets))
         self.assertEqual(P.STATION_UP_V1, economy.shopping_list(turn)[0][0])
 
+    def test_weapon_growth_reaches_three_two_one_before_optional_growth(self):
+        rockets = tuple(
+            replace(
+                self.rocket, unit_id=500 + index, pos=P.Pos(5 + index, 5),
+                level=level, health=economy._wall_max_health(level),
+            )
+            for index, level in enumerate((2, 1, 1))
+        )
+        turn = replace(self.base, round_no=140, gold=150, ours=(self.station, *rockets))
+        self.assertEqual(P.WEAPON_UP_V2, economy.shopping_list(turn)[0][0])
+
+    def test_core_battery_forces_two_central_walls_to_level_three(self):
+        station = replace(self.station, pos=P.Pos(9, 22))
+        enemy = replace(self.station, unit_id=99999, pos=P.Pos(30, 9))
+        rockets = tuple(
+            replace(
+                self.rocket, unit_id=500 + index, pos=P.Pos(8, 20 + index),
+                level=level, health=economy._wall_max_health(level),
+            )
+            for index, level in enumerate((3, 2, 1))
+        )
+        front_positions = (P.Pos(12, 21), P.Pos(12, 22), P.Pos(12, 20), P.Pos(12, 23))
+        walls = tuple(
+            replace(self.wall, unit_id=40000 + index, pos=pos, level=1, health=1000)
+            for index, pos in enumerate(front_positions)
+        )
+        turn = replace(
+            self.base, round_no=140, gold=100,
+            ours=(station, *rockets, *walls), enemy_roles=(enemy,),
+        )
+        self.assertEqual(
+            (P.WALL_UP_V1, 2), economy.shopping_list(turn)[0],
+        )
+
+        level_two = tuple(
+            replace(wall, level=2, health=1500) if wall.pos in front_positions[:2] else wall
+            for wall in walls
+        )
+        turn = replace(turn, ours=(station, *rockets, *level_two), gold=60)
+        self.assertEqual(
+            (P.WALL_UP_V2, 2), economy.shopping_list(turn)[0],
+        )
+
+    def test_level_three_anchor_fortifies_centre_before_second_rocket(self):
+        station = replace(self.station, pos=P.Pos(9, 22))
+        enemy = replace(self.station, unit_id=99999, pos=P.Pos(30, 9))
+        rockets = tuple(
+            replace(
+                self.rocket, unit_id=500 + index, pos=P.Pos(8, 20 + index),
+                level=level, health=economy._wall_max_health(level),
+            )
+            for index, level in enumerate((3, 1, 1))
+        )
+        walls = (
+            replace(self.wall, unit_id=40000, pos=P.Pos(12, 21), level=1, health=1000),
+            replace(self.wall, unit_id=40001, pos=P.Pos(12, 22), level=1, health=1000),
+        )
+        turn = replace(
+            self.base, round_no=140, gold=100,
+            ours=(station, *rockets, *walls), enemy_roles=(enemy,),
+        )
+        self.assertEqual((P.WALL_UP_V1, 2), economy.shopping_list(turn)[0])
+
+    def test_wall_upgrade_targets_centre_before_more_damaged_flank(self):
+        station = replace(self.station, pos=P.Pos(9, 22))
+        enemy = replace(self.station, unit_id=99999, pos=P.Pos(30, 9))
+        centre = replace(self.wall, unit_id=40000, pos=P.Pos(12, 21), health=1000)
+        other_centre = replace(self.wall, unit_id=40001, pos=P.Pos(12, 22), health=1000)
+        damaged_flank = replace(self.wall, unit_id=40002, pos=P.Pos(12, 20), health=1)
+        holder = replace(
+            self.sample.workers()[1], pos=P.Pos(11, 21), backpack=(P.WALL_UP_V1,),
+        )
+        turn = replace(
+            self.base, round_no=140,
+            ours=(station, holder, centre, other_centre, damaged_flank),
+            enemy_roles=(enemy,),
+        )
+        with patch.object(brain, "MEMORY", Memory()):
+            commands = {}
+            brain._carry_to_use(turn, holder, P.WALL_UP_V1, set(), commands)
+        self.assertEqual("use", commands[holder.unit_id]["action"])
+        self.assertEqual(centre.pos.dump(), commands[holder.unit_id]["targetPos"][0])
+
+    def test_late_day_three_central_wall_upgrade_is_emergency_purchase(self):
+        station = replace(self.station, pos=P.Pos(9, 22))
+        enemy = replace(self.station, unit_id=99999, pos=P.Pos(30, 9))
+        rockets = tuple(
+            replace(
+                self.rocket, unit_id=500 + index, pos=P.Pos(8, 20 + index),
+                level=level, health=economy._wall_max_health(level),
+            )
+            for index, level in enumerate((3, 2, 1))
+        )
+        walls = (
+            replace(self.wall, unit_id=40000, pos=P.Pos(12, 21), level=2, health=1500),
+            replace(self.wall, unit_id=40001, pos=P.Pos(12, 22), level=2, health=1500),
+        )
+        turn = replace(
+            self.base, round_no=310, gold=60,
+            ours=(station, *rockets, *walls), enemy_roles=(enemy,),
+        )
+        self.assertEqual(
+            (P.WALL_UP_V2, 2), economy.emergency_shopping_list(turn)[0],
+        )
+
     def test_three_two_one_battery_inserts_station_insurance_when_damaged(self):
         levels = (3, 2, 1)
         rockets = tuple(

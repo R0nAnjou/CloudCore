@@ -6,7 +6,7 @@ import shlex
 from dataclasses import replace
 from typing import Any
 
-from . import protocol as P
+from . import economy, protocol as P
 from .grid import adjacent_stands, path_to_any, next_step_adjacent
 from .memory import Memory, SopRecord
 from .protocol import (
@@ -627,6 +627,8 @@ def _treasure_action(
         reserve = (100 if station.level == 1 else 150) if (
             station and station.level < 3 and station.health < 1500 * station.level * 0.65
         ) else 20
+        if P.day_index(turn.round_no) <= 3:
+            reserve = max(reserve, economy.central_wall_upgrade_reserve(turn))
         if (
             shop is None
             or price <= 0

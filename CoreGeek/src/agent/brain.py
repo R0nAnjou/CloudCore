@@ -26,7 +26,7 @@ LOGGER = logging.getLogger(__name__)
 
 MEMORY = Memory()
 _DECISION_LOCK = threading.Lock()
-STRATEGY_VERSION = "continuous-c-wall-two-operator-20260924"
+STRATEGY_VERSION = "central-wall-l3-two-operator-20260924"
 UPGRADE_ITEMS = (
     P.STATION_UP_V1, P.STATION_UP_V2, P.WEAPON_UP_V1, P.WEAPON_UP_V2,
     P.WALL_UP_V1, P.WALL_UP_V2,
@@ -806,10 +806,15 @@ def _carry_to_use(
     elif name.startswith("WallUpgrade"):
         wanted_level = 1 if name == P.WALL_UP_V1 else 2
         front = set(_front_wall_sites(turn))
+        central = {
+            wall.pos: index
+            for index, wall in enumerate(economy.central_front_walls(turn))
+        }
         wall = min(
             (w for w in turn.walls() if w.level == wanted_level),
             key=lambda item: (
-                item.pos not in front,
+                0 if item.pos in central else 1 if item.pos in front else 2,
+                central.get(item.pos, 99),
                 item.health / economy._wall_max_health(item.level),
                 -_enemy_projection(turn, item.pos),
                 item.unit_id,
@@ -1028,18 +1033,22 @@ def _ring(footprint: tuple[Pos, ...], radius: int) -> list[Pos]:
 
 def _log_defense_snapshot(turn: P.Turn, commands: dict[int, dict[str, Any]]) -> None:
     station = turn.station()
+    central_walls = economy.central_front_walls(turn)
     day_round = (turn.round_no - 1) % P.ROUNDS_PER_DAY + 1
     if day_round in {1, 50, 60} or 70 <= day_round <= 80 or turn.round_no % 10 == 0:
         LOGGER.info(
             "defense round=%d station_hp=%s walls=%d towers=%d workers=%d "
-            "gold=%d stone=%d robots=%d ready_towers=%d attacks=%d station_level=%d score=%d",
+            "gold=%d stone=%d robots=%d ready_towers=%d attacks=%d station_level=%d "
+            "central_walls=%s score=%d",
             turn.round_no, station.health if station else 0, len(turn.walls()),
             len(turn.weapons()), len(turn.workers()), turn.gold,
             sum(worker.count(P.STONE) for worker in turn.workers()), len(turn.robots),
             sum(any(distance(role.pos, tower.pos) <= 1
                     for role in turn.controllable()) for tower in turn.weapons()),
             sum(command.get("action") == "attack" for command in commands.values()),
-            station.level if station else 0, turn.total_score,
+            station.level if station else 0,
+            [(wall.pos.x, wall.pos.y, wall.level, wall.health) for wall in central_walls],
+            turn.total_score,
         )
         LOGGER.info("roles round=%d state=%s", turn.round_no, [
             (role.unit_id, role.pos.x, role.pos.y, role.health,
