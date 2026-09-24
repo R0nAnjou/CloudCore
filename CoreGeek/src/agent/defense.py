@@ -185,6 +185,7 @@ def _choose_targets(
 
     if tower.kind == ROCKET:
         weights = {robot.robot_id: _threat_weight(turn, robot) for robot in in_range}
+        center_damage = tower.attack_power or 20
         # 导弹允许落点重叠；逐枚选择边际收益最大的格，确保数量始终等于等级。
         candidates = {
             pos
@@ -199,11 +200,13 @@ def _choose_targets(
         for _ in range(max(1, tower.level)):
             best = max(
                 candidates,
-                key=lambda center: (_rocket_value(turn, center, in_range, simulated, weights),
+                key=lambda center: (_rocket_value(
+                    turn, center, in_range, simulated, weights, center_damage,
+                ),
                                     -center.x, -center.y),
             )
             chosen.append(best)
-            _apply_rocket(best, in_range, simulated)
+            _apply_rocket(best, in_range, simulated, center_damage)
         return chosen
 
     if tower.kind == RAILGUN:
@@ -217,7 +220,7 @@ def _choose_targets(
                 and r.pos in path
                 and distance(tower.pos, r.pos) <= reach
             ]
-            energy = 10 * tower.level
+            energy = tower.attack_power or 10 * tower.level
             value = 0
             for r in sorted(blockers, key=lambda r: distance(tower.pos, r.pos)):
                 hp = remaining_hp[r.robot_id]
@@ -278,13 +281,14 @@ def _rocket_value(
     robots: list[Robot],
     remaining_hp: dict[int, int],
     weights: dict[int, int] | None = None,
+    center_damage: int = 20,
 ) -> int:
     value = 0
     for robot in robots:
         hp = remaining_hp.get(robot.robot_id, 0)
         if hp <= 0 or distance(center, robot.pos) > 1:
             continue
-        damage = 20 if robot.pos == center else 10
+        damage = center_damage if robot.pos == center else max(1, center_damage // 2)
         multiplier = weights[robot.robot_id] if weights is not None else _threat_weight(turn, robot)
         value += (min(damage, hp) + (10 if hp <= damage else 0)) * multiplier + robot.score
     return value
@@ -301,12 +305,19 @@ def _threat_weight(turn: P.Turn, robot: Robot) -> int:
     return (3 if targets_us else 1) + urgency
 
 
-def _apply_rocket(center: Pos, robots: list[Robot], remaining_hp: dict[int, int]) -> None:
+def _apply_rocket(
+    center: Pos,
+    robots: list[Robot],
+    remaining_hp: dict[int, int],
+    center_damage: int = 20,
+) -> None:
     for robot in robots:
         hp = remaining_hp.get(robot.robot_id, 0)
         if hp <= 0 or distance(center, robot.pos) > 1:
             continue
-        remaining_hp[robot.robot_id] = hp - (20 if robot.pos == center else 10)
+        remaining_hp[robot.robot_id] = hp - (
+            center_damage if robot.pos == center else max(1, center_damage // 2)
+        )
 
 
 def _within_90deg(origin: P.Pos, a: P.Pos, b: P.Pos) -> bool:
@@ -325,10 +336,11 @@ def _deduct_expected(
 ) -> None:
     """预扣本回合伤害, 让后续武器的目标选择知道'这只怪会被打掉多少血'。"""
     if tower.kind == ROCKET:
+        center_damage = tower.attack_power or 20
         for center in targets:
-            _apply_rocket(center, robots, remaining_hp)
+            _apply_rocket(center, robots, remaining_hp, center_damage)
     elif tower.kind == RAILGUN:
-        energy = 10 * tower.level
+        energy = tower.attack_power or 10 * tower.level
         path = line_cells(tower.pos, targets[0]) if targets else []
         for r in sorted(robots, key=lambda r: distance(tower.pos, r.pos)):
             hp = remaining_hp.get(r.robot_id, 0)
@@ -339,12 +351,13 @@ def _deduct_expected(
                 if energy <= 0:
                     break
     else:  # gatling
+        bullet_damage = tower.attack_power or 10
         for pos in targets:
             path = line_cells(tower.pos, pos)
             for r in sorted(robots, key=lambda r: distance(tower.pos, r.pos)):
                 hp = remaining_hp.get(r.robot_id, 0)
                 if hp > 0 and r.pos in path:
-                    remaining_hp[r.robot_id] = hp - 10
+                    remaining_hp[r.robot_id] = hp - bullet_damage
                     break
 
 

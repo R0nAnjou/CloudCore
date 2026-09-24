@@ -55,6 +55,9 @@ class Memory:
     position_history: dict[int, list[Pos]] = field(default_factory=dict)
     returning_roles: set[int] = field(default_factory=set)
     gate_pos: Pos | None = None
+    # 三炮共享炮位会被基地和炮台围成口袋，需要一处只供开拓者进出的临时舱门。
+    # gate_pos 始终是背敌面的工人后门，不能再被炮位布局覆盖。
+    gunner_hatch_pos: Pos | None = None
     tower_layout: tuple[Pos, ...] = ()
     gunner_pos: Pos | None = None
     task_outcomes: dict[Pos, tuple[int, int]] = field(default_factory=dict)

@@ -478,7 +478,10 @@ def _hold_near_station(
 
 
 def _move_reserved(memory: Memory, worker: Unit, claimed: set[Pos]) -> set[Pos]:
-    return set(claimed) | memory.failed_move_cells(worker.unit_id)
+    reserved = set(claimed) | memory.failed_move_cells(worker.unit_id)
+    if worker.kind == P.WORKER and memory.gunner_pos is not None and worker.pos != memory.gunner_pos:
+        reserved.add(memory.gunner_pos)
+    return reserved
 
 
 def shopping_list(turn: P.Turn) -> list[tuple[str, int]]:
@@ -512,12 +515,11 @@ def shopping_list(turn: P.Turn) -> list[tuple[str, int]]:
     # 三炮成型后先把基地升二级，再扩第一门火箭；先抬高生存线，避免后期被秒基地。
     weapons = turn.weapons()
     level1_weapon = next((weapon for weapon in weapons if weapon.level == 1), None)
-    has_level2_weapon = any(weapon.level >= 2 for weapon in weapons)
     if station is not None and station.level == 1 and len(weapons) >= 3 and not urgent_station:
         add(STATION_UP_V1, 100)
-    if level1_weapon is not None and not has_level2_weapon:
-        add(WEAPON_UP_V1, 100)
-    if level1_weapon is not None and has_level2_weapon:
+    # 无论是否已有二级炮，只要还有一级炮就继续买一级升级券。
+    # 原先两个互补分支内容完全相同，既容易误读，也掩盖了真实的成长顺序。
+    if level1_weapon is not None:
         add(WEAPON_UP_V1, 100)
 
     if any(worker.health < 110 for worker in turn.workers()):

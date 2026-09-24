@@ -9,7 +9,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from agent import brain, defense, economy  # noqa: E402
+from agent import brain, defense, economy, protocol as P  # noqa: E402
 from agent.memory import Memory  # noqa: E402
 from agent.protocol import Pos, Robot, STATION_UP_V1, Turn, WALL_FIXER  # noqa: E402
 
@@ -29,7 +29,7 @@ class DefenseEconomyTests(unittest.TestCase):
             plan = brain._build_plan(turn)
         self.assertEqual(3, len(plan.tower_sites))
         self.assertEqual(("rocket", "rocket", "rocket"), plan.tower_kinds)
-        self.assertEqual(19, len(plan.wall_sites))
+        self.assertEqual(18, len(plan.wall_sites))
         inside_worker = replace(self.worker, pos=Pos(9, 24))
         turn = replace(turn, round_no=65, ours=(self.station, inside_worker))
         with patch.object(brain, "MEMORY", Memory()):
@@ -39,7 +39,7 @@ class DefenseEconomyTests(unittest.TestCase):
         turn = replace(turn, ours=(self.station, outside_worker))
         with patch.object(brain, "MEMORY", Memory()):
             plan = brain._build_plan(turn)
-        self.assertEqual(19, len(plan.wall_sites))
+        self.assertEqual(18, len(plan.wall_sites))
 
     def test_outside_income_worker_does_not_block_gate_closing(self) -> None:
         defender = replace(self.turn.workers()[0], pos=Pos(9, 24), backpack=("stone",))
@@ -69,9 +69,7 @@ class DefenseEconomyTests(unittest.TestCase):
                         ours=(self.station,), player_tasks=(), phase_task="")
         with patch.object(brain, "MEMORY", Memory()):
             plan = brain._build_plan(empty)
-        gate = next(pos for pos in brain._ring(
-            brain.station_footprint(self.station.pos), 2,
-        ) if pos not in plan.wall_sites)
+            gate = brain._gate_position(empty)
         walls = tuple(
             replace(self.wall, unit_id=40000 + index, pos=pos, health=1000)
             for index, pos in enumerate(plan.wall_sites)
@@ -95,9 +93,7 @@ class DefenseEconomyTests(unittest.TestCase):
                         ours=(self.station,), player_tasks=(), phase_task="")
         with patch.object(brain, "MEMORY", Memory()):
             plan = brain._build_plan(empty)
-        gate = next(pos for pos in brain._ring(
-            brain.station_footprint(self.station.pos), 2,
-        ) if pos not in plan.wall_sites)
+            gate = brain._gate_position(empty)
         walls = tuple(
             replace(self.wall, unit_id=40000 + index, pos=pos, health=1000)
             for index, pos in enumerate(plan.wall_sites)
@@ -273,6 +269,16 @@ class DefenseEconomyTests(unittest.TestCase):
         remaining = {1: 20, 2: 20}
         defense._deduct_expected(tower, [rear.pos], [front, rear], remaining)
         self.assertEqual({1: 10, 2: 20}, remaining)
+
+    def test_server_attack_power_drives_expected_rocket_damage(self) -> None:
+        self.assertGreater(self.turn.weapons()[0].attack_power, 0)
+        tower = replace(
+            self.turn.weapons()[-1], kind=P.ROCKET, level=1, attack_power=40,
+        )
+        robot = P.Robot(99, Pos(11, 11), P.LARGE_ROBOT, 100, False, self.turn.team_type)
+        remaining = {robot.robot_id: robot.health}
+        defense._deduct_expected(tower, [robot.pos], [robot], remaining)
+        self.assertEqual(60, remaining[robot.robot_id])
 
     def test_carried_repair_kit_is_used_without_gold_by_day_and_night(self) -> None:
         wall = replace(self.wall, pos=Pos(8, 22), health=300)

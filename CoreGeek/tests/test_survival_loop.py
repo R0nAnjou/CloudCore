@@ -106,8 +106,12 @@ class SurvivalLoopTests(unittest.TestCase):
                 spare = next(pos for pos in inner if pos != doorway and pos not in plan.tower_sites)
                 second = replace(self.sample.workers()[1], pos=spare, backpack=(P.STONE,) * 3)
                 extras = (*towers, second)
-            turn = replace(self.base, round_no=60, ours=(self.station, worker, pioneer, *walls, *extras))
-            for number in range(60, 71):
+            start_round = 54 if with_towers else 60
+            turn = replace(
+                self.base, round_no=start_round,
+                ours=(self.station, worker, pioneer, *walls, *extras),
+            )
+            for number in range(start_round, 71):
                 turn = replace(turn, round_no=number)
                 commands = {}
                 brain._day_phase(turn, commands)
@@ -213,7 +217,7 @@ class SurvivalLoopTests(unittest.TestCase):
             self.assertTrue(set(plan.tower_sites) <= set(brain._ring(footprint, 1)))
             self.assertTrue(set(plan.wall_sites) <= set(brain._ring(footprint, 2)))
             self.assertEqual(3, len(plan.tower_sites))
-            self.assertEqual(19, len(plan.wall_sites))
+            self.assertEqual(18, len(plan.wall_sites))
 
     def test_post_wave_rocket_attacks_enemy_wall(self):
         pioneer = replace(self.sample.pioneers()[0], pos=P.Pos(5, 5), backpack=())
@@ -252,6 +256,50 @@ class SurvivalLoopTests(unittest.TestCase):
         new_pos = P.Pos.load(commands[workers[1].unit_id]["targetPos"][0])
         new_clearance = min(P.distance(new_pos, item.pos) for item in turn.robots)
         self.assertGreater(new_clearance, old_clearance)
+
+    def test_unstaged_pioneer_allows_a_worker_to_fire_second_ready_rocket(self):
+        shared = P.Pos(5, 5)
+        first_worker = replace(self.worker, pos=shared, backpack=())
+        second_worker = replace(self.sample.workers()[1], pos=P.Pos(20, 20), backpack=())
+        pioneer = replace(self.sample.pioneers()[0], pos=P.Pos(7, 5), backpack=())
+        towers = tuple(
+            replace(self.rocket, unit_id=500 + index, pos=pos, cooldown=0)
+            for index, pos in enumerate((P.Pos(4, 5), P.Pos(5, 4), P.Pos(6, 5)))
+        )
+        robot = P.Robot(1, P.Pos(7, 7), P.BOSS_ROBOT, 800, False, self.base.team_type)
+        turn = replace(
+            self.base, round_no=331, is_day=False,
+            ours=(self.station, first_worker, pioneer, second_worker, *towers),
+            robots=(robot,),
+        )
+        with patch.object(brain, "MEMORY", Memory(gunner_pos=shared)):
+            commands = {}
+            brain._night_phase(turn, commands)
+        attacks = [command for command in commands.values() if command["action"] == "attack"]
+        self.assertEqual(2, len(attacks))
+        self.assertEqual(
+            {str(first_worker.unit_id), str(pioneer.unit_id)},
+            {command["controllerId"] for command in attacks},
+        )
+
+    def test_carried_weapon_upgrade_is_used_at_night_before_mining(self):
+        rocket = replace(self.rocket, pos=P.Pos(9, 25), level=1)
+        first_worker = replace(self.worker, pos=P.Pos(9, 24), backpack=())
+        holder = replace(
+            self.sample.workers()[1], pos=P.Pos(10, 25),
+            backpack=(P.WEAPON_UP_V1,),
+        )
+        turn = replace(
+            self.base, round_no=331, is_day=False,
+            ours=(self.station, first_worker, holder, rocket), robots=(),
+        )
+        with patch.object(brain, "MEMORY", Memory()):
+            self.assertIsNone(brain._night_miner(turn))
+            commands = {}
+            brain._night_phase(turn, commands)
+        self.assertEqual("use", commands[holder.unit_id]["action"])
+        self.assertEqual(P.WEAPON_UP_V1, commands[holder.unit_id]["name"])
+        self.assertEqual(rocket.pos.dump(), commands[holder.unit_id]["targetPos"][0])
 
     def test_safe_night_miner_keeps_collecting_while_robots_exist(self):
         worker = replace(self.worker, pos=P.Pos(5, 22), backpack=())
@@ -396,6 +444,12 @@ class SurvivalLoopTests(unittest.TestCase):
             gate = brain._gate_position(turn)
             front = brain._front_wall_sites(turn)
             self.assertNotIn(gate, front)
+            ring = brain._ring(P.station_footprint(self.station.pos), 2)
+            self.assertEqual(
+                min(brain._enemy_projection(turn, pos) for pos in ring),
+                brain._enemy_projection(turn, gate),
+            )
+            self.assertNotEqual(gate, brain.MEMORY.gunner_hatch_pos)
             self.assertLess(
                 brain._enemy_projection(turn, gate),
                 min(brain._enemy_projection(turn, pos) for pos in front),
@@ -427,6 +481,11 @@ class SurvivalLoopTests(unittest.TestCase):
                     P.distance(brain.MEMORY.gunner_pos, pos) <= 1
                     for pos in plan.tower_sites
                 ))
+                ring = brain._ring(P.station_footprint(station.pos), 2)
+                self.assertEqual(
+                    min(brain._enemy_projection(turn, pos) for pos in ring),
+                    brain._enemy_projection(turn, brain.MEMORY.gate_pos),
+                )
                 self.assertNotIn(brain.MEMORY.gate_pos, brain._front_wall_sites(turn))
 
     def test_both_workers_build_until_first_night_wall_quota(self):

@@ -114,6 +114,7 @@ class Unit:
     attack_range: int
     capacity: int | None
     backpack: tuple[str, ...]
+    attack_power: int = 0
 
     @classmethod
     def load(cls, raw: dict[str, Any]) -> "Unit":
@@ -128,6 +129,7 @@ class Unit:
             int(raw.get("attackRange") or 0),
             int(raw_capacity) if raw_capacity is not None else None,
             tuple(str(item) for item in raw.get("backpack") or ()),
+            int(raw.get("attackPower") or 0),
         )
 
     def has(self, item: str) -> bool:
