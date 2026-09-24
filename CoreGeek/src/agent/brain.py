@@ -26,7 +26,7 @@ LOGGER = logging.getLogger(__name__)
 
 MEMORY = Memory()
 _DECISION_LOCK = threading.Lock()
-STRATEGY_VERSION = "central-wall-l3-two-operator-20260924"
+STRATEGY_VERSION = "survival-gate-331-20260924"
 UPGRADE_ITEMS = (
     P.STATION_UP_V1, P.STATION_UP_V2, P.WEAPON_UP_V1, P.WEAPON_UP_V2,
     P.WALL_UP_V1, P.WALL_UP_V2,
@@ -288,6 +288,11 @@ def _day_phase(
     MEMORY.current_round = turn.round_no
     if day_round == 1:
         MEMORY.returning_roles.clear()
+    # 三炮建成后，固定中央双墙任一缺失就是结构性破口。此状态必须抢占
+    # 普通修墙、购物和侧墙建造，直到原坐标重建，不能把旁边的墙误当中央墙。
+    central_rebuild = (
+        len(turn.weapons()) >= 3 and not economy.central_front_intact(turn)
+    )
 
     has_carried_upgrade = any(
         any(worker.has(name) for name in UPGRADE_ITEMS) for worker in workers
@@ -320,7 +325,7 @@ def _day_phase(
         if worker.unit_id not in commands and worker.has(P.MEDICINE) and worker.health < 132:
             commands[worker.unit_id] = use_command(P.MEDICINE)
         if (worker.unit_id not in commands and builder is not None
-                and worker.unit_id == builder.unit_id):
+                and worker.unit_id == builder.unit_id and not central_rebuild):
             economy.move_or_repair_wall(
                 turn, worker, claimed, commands,
                 urgent_only=worker.unit_id in MEMORY.returning_roles,
@@ -331,6 +336,12 @@ def _day_phase(
             _return_home(turn, worker, claimed, commands)
 
     if day_round >= 60:
+        if (central_rebuild and day_round < 66 and builder is not None
+                and builder.unit_id not in commands):
+            economy.worker_day(
+                turn, builder, plan, claimed, claimed_sites, MEMORY, commands,
+                force_stone=True,
+            )
         # 夜幕将至：建造工回双炮位，矿工继续外部现金流，开拓者回单炮位。
         if (release_night_miner and night_miner is not None
                 and night_miner.unit_id not in commands):
@@ -356,6 +367,8 @@ def _day_phase(
                     turn, worker, plan, claimed, claimed_sites, MEMORY, commands,
                     income_only=(night_miner is not None
                                  and worker.unit_id == night_miner.unit_id),
+                    force_stone=(central_rebuild and builder is not None
+                                 and worker.unit_id == builder.unit_id),
                 )
 
     # 开拓者: 任务引擎

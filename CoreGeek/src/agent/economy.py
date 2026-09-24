@@ -57,17 +57,16 @@ class Plan:
     wall_sites: tuple[Pos, ...] = ()
 
 
-def central_front_walls(turn: P.Turn) -> tuple[Unit, ...]:
-    """返回迎敌正面最中间的两面已建围墙。
-
-    先按敌方所在的主方向取最外侧墙线，再按与基地中心的横向偏移取中间两格。
-    这与四个出生角的镜像 C 墙布局兼容。
-    """
+def central_front_positions(turn: P.Turn) -> tuple[Pos, ...]:
+    """根据基地与敌方方位计算固定的迎敌中央双墙坐标。"""
     station = turn.station()
-    walls = list(turn.walls())
-    if station is None or len(walls) < 2:
+    if station is None:
         return ()
     footprint = station_footprint(station.pos)
+    xs = [pos.x for pos in footprint]
+    ys = [pos.y for pos in footprint]
+    xmin, xmax = min(xs), max(xs)
+    ymin, ymax = min(ys), max(ys)
     base_x = sum(pos.x for pos in footprint) / len(footprint)
     base_y = sum(pos.y for pos in footprint) / len(footprint)
     enemy_station = next(
@@ -84,16 +83,27 @@ def central_front_walls(turn: P.Turn) -> tuple[Unit, ...]:
         enemy_x, enemy_y = turn.width / 2, turn.height / 2
     delta_x, delta_y = enemy_x - base_x, enemy_y - base_y
     if abs(delta_x) >= abs(delta_y):
-        edge = (max(wall.pos.x for wall in walls) if delta_x >= 0
-                else min(wall.pos.x for wall in walls))
-        front = [wall for wall in walls if wall.pos.x == edge]
-        front.sort(key=lambda wall: (abs(wall.pos.y - base_y), wall.pos.y, wall.unit_id))
-    else:
-        edge = (max(wall.pos.y for wall in walls) if delta_y >= 0
-                else min(wall.pos.y for wall in walls))
-        front = [wall for wall in walls if wall.pos.y == edge]
-        front.sort(key=lambda wall: (abs(wall.pos.x - base_x), wall.pos.x, wall.unit_id))
-    return tuple(front[:2]) if len(front) >= 2 else ()
+        front_x = xmax + 2 if delta_x >= 0 else xmin - 2
+        return Pos(front_x, ymin), Pos(front_x, ymax)
+    front_y = ymax + 2 if delta_y >= 0 else ymin - 2
+    return Pos(xmin, front_y), Pos(xmax, front_y)
+
+
+def central_front_walls(turn: P.Turn) -> tuple[Unit, ...]:
+    """只返回固定中央坐标上实际存活的墙，缺墙时不向侧面漂移。"""
+    walls_by_pos = {wall.pos: wall for wall in turn.walls()}
+    return tuple(
+        walls_by_pos[pos]
+        for pos in central_front_positions(turn)
+        if pos in walls_by_pos
+    )
+
+
+def central_front_intact(turn: P.Turn) -> bool:
+    positions = central_front_positions(turn)
+    return bool(positions) and all(
+        any(wall.pos == pos for wall in turn.walls()) for pos in positions
+    )
 
 
 def central_wall_upgrade_need(turn: P.Turn) -> tuple[str, int] | None:
@@ -326,10 +336,21 @@ def _try_build(
         if site not in standing and worker.count(P.WALL_MATERIAL) > 0 and memory.build_allowed(site, WALL):
             jobs.append((site, WALL))
 
-    jobs.sort(key=lambda job: (job[1] == WALL, distance(worker.pos, job[0])))
+    central_sites = set(central_front_positions(turn))
+
+    def job_priority(job: tuple[Pos, str]) -> int:
+        if job[1] != WALL:
+            return 0
+        if job[0] in central_sites:
+            return 1
+        return 2
+
+    # 炮台仍是开局第一优先；墙体中固定的迎敌中央双墙永远先于侧墙。
+    # 不能因为中央墙被打掉，就沿用上一回合锁定的侧墙目标。
+    jobs.sort(key=lambda job: (job_priority(job), distance(worker.pos, job[0])))
     locked = memory.worker_targets.get(worker.unit_id)
     if memory.worker_target_kinds.get(worker.unit_id) == "build" and locked is not None:
-        jobs.sort(key=lambda job: (job[0] != locked, job[1] == WALL,
+        jobs.sort(key=lambda job: (job_priority(job), job[0] != locked,
                                    distance(worker.pos, job[0])))
 
     for site, kind in jobs:
@@ -389,9 +410,11 @@ def _try_sell(
         for ore in (COPPER, IRON, STONE)
     )
     nearly_full = worker.capacity is not None and len(worker.backpack) >= int(worker.capacity * 0.8)
+    day_round = (turn.round_no - 1) % P.ROUNDS_PER_DAY + 1
     needs_cash = cash_first and (
-        turn.gold < 100 <= turn.gold + best_value
-        or (turn.round_no - 1) % P.ROUNDS_PER_DAY + 1 >= 45
+        any(turn.gold < target <= turn.gold + best_value for target in (100, 150))
+        or (day >= 3 and day_round >= 35)
+        or day_round >= 45
     )
     if total_sellable < SELL_BATCH and not nearly_full and not needs_cash:
         return False
@@ -554,7 +577,7 @@ def _move_reserved(memory: Memory, worker: Unit, claimed: set[Pos]) -> set[Pos]:
 
 
 def shopping_list(turn: P.Turn) -> list[tuple[str, int]]:
-    """主火箭三级后，第三夜前锁定中央双墙三级。"""
+    """第三夜硬门槛：中央双墙 3-3、火箭至少 3-2-1，再冲 3-3-1。"""
     items: list[tuple[str, int]] = []
     gold = turn.gold
     station = turn.station()
@@ -574,7 +597,14 @@ def shopping_list(turn: P.Turn) -> list[tuple[str, int]]:
         gold -= price * quantity
         return True
 
-    urgent_station = station is not None and station.health < 1500 * max(1, station.level) * 0.50
+    day = P.day_index(turn.round_no)
+    station_ratio = (
+        station.health / (1500 * max(1, station.level)) if station is not None else 1.0
+    )
+    urgent_station = (
+        station is not None and station.level < 3
+        and (station_ratio < 0.50 or (day >= 4 and station_ratio < 0.90))
+    )
     station_item = (STATION_UP_V1, 100) if station and station.level == 1 else (STATION_UP_V2, 150)
     if urgent_station and station.level < 3:
         add(*station_item)
@@ -597,30 +627,35 @@ def shopping_list(turn: P.Turn) -> list[tuple[str, int]]:
         and station.health < 1500 * station.level * 0.90 and core_battery
     )
     central_need = central_wall_upgrade_need(turn)
-    fortify_centre = (
-        P.day_index(turn.round_no) >= 2 and fire_anchor and central_need is not None
-    )
+    central_intact = central_front_intact(turn)
+    fortify_centre = day >= 2 and fire_anchor and central_need is not None
 
-    # 真实路径：1-1-1 -> 2-1-1 -> 3-1-1，然后立即冻结其他普通成长，
-    # 先把中央双墙做到 2-2，再做到 3-3；之后才继续到 3-2-1。
+    # 真实路径：1-1-1 -> 2-1-1 -> 3-1-1，然后冻结普通成长，
+    # 先把固定中央双墙做到 3-3；再保底 3-2-1，有余力立即冲 3-3-1。
     if len(weapons) >= 3 and not urgent_station:
         if not fire_anchor and levels[0] < 2:
             add(WEAPON_UP_V1, 100)
         elif not fire_anchor and levels[0] < 3:
             add(WEAPON_UP_V2, 150)
-        elif fortify_centre and central_need is not None:
-            name, quantity = central_need
-            add(name, 20 if name == WALL_UP_V1 else 30, target=quantity)
-        elif not core_battery and levels[1] < 2:
-            add(WEAPON_UP_V1, 100)
         elif station_insurance:
             add(
                 STATION_UP_V1 if station and station.level == 1 else STATION_UP_V2,
                 100 if station and station.level == 1 else 150,
             )
-        elif any(weapon.level == 1 for weapon in weapons):
+        elif fire_anchor and not central_intact:
+            # 缺墙不花建材金币；把钱留到墙重建后立即补回二、三级。
+            pass
+        elif fortify_centre and central_need is not None:
+            name, quantity = central_need
+            add(name, 20 if name == WALL_UP_V1 else 30, target=quantity)
+        elif not core_battery and levels[1] < 2:
             add(WEAPON_UP_V1, 100)
-        elif any(weapon.level == 2 for weapon in weapons):
+        elif levels[1] < 3:
+            # 第二炮先到三级，形成两个远射程炮手并行输出；第三炮随后成长。
+            add(WEAPON_UP_V2, 150)
+        elif levels[2] < 2:
+            add(WEAPON_UP_V1, 100)
+        elif levels[2] < 3:
             add(WEAPON_UP_V2, 150)
 
     if any(worker.health < 110 for worker in turn.workers()):
@@ -669,8 +704,12 @@ def emergency_shopping_list(turn: P.Turn) -> list[tuple[str, int]]:
             gold -= price
 
     station = turn.station()
+    day = P.day_index(turn.round_no)
+    station_ratio = (
+        station.health / (1500 * max(1, station.level)) if station is not None else 1.0
+    )
     if (station is not None and station.level < 3
-            and station.health < 1500 * max(1, station.level) * 0.50):
+            and (station_ratio < 0.50 or (day >= 4 and station_ratio < 0.90))):
         add(STATION_UP_V1 if station.level == 1 else STATION_UP_V2,
             100 if station.level == 1 else 150)
 
@@ -684,14 +723,13 @@ def emergency_shopping_list(turn: P.Turn) -> list[tuple[str, int]]:
             and not any(role.has(P.MEDICINE) for role in turn.controllable())):
         add(P.MEDICINE, 10)
 
-    # 第三天最后 20 回合仍未完成中央双墙三级时，将其提升为
-    # 夜战应急采购，突破普通购物在第 60 回合后停止的限制。
+    # 第三天开始就把未完成的中央墙升级提升为应急采购。它必须抢在
+    # 日常修墙动作之前执行，否则工人会连续修墙，明明有钱却到夜前仍不买券。
     day_round = (turn.round_no - 1) % P.ROUNDS_PER_DAY + 1
     levels = sorted((weapon.level for weapon in turn.weapons()), reverse=True)
     fire_anchor = len(levels) >= 3 and levels[0] >= 3
     central_need = central_wall_upgrade_need(turn)
-    if (P.day_index(turn.round_no) == 3 and day_round >= 50
-            and fire_anchor and central_need is not None):
+    if day == 3 and fire_anchor and central_need is not None:
         name, quantity = central_need
         price = turn.shop_prices.get(name, 20 if name == WALL_UP_V1 else 30)
         carried = sum(role.count(name) for role in turn.controllable())
@@ -703,6 +741,30 @@ def emergency_shopping_list(turn: P.Turn) -> list[tuple[str, int]]:
                 items.append((name, affordable))
             else:
                 items.insert(0, (name, affordable))
+            gold -= price * affordable
+
+    # 第三天最后阶段不能再受普通购物截止限制。中央墙完成以后，先确保
+    # 第二门火箭升二级(3-2-1)，金币足够时继续升三级(3-3-1)。
+    central_ready = (
+        central_front_intact(turn)
+        and len(central_front_walls(turn)) == 2
+        and all(wall.level >= 3 for wall in central_front_walls(turn))
+    )
+    carried_names = {
+        name for role in turn.controllable() for name in role.backpack
+    }
+    already_wanted = {name for name, _ in items}
+    if (day == 3 and central_ready and len(levels) >= 3
+            and levels[0] >= 3):
+        if levels[1] < 2:
+            name, price = WEAPON_UP_V1, turn.shop_prices.get(WEAPON_UP_V1, 100)
+        elif levels[1] < 3:
+            name, price = WEAPON_UP_V2, turn.shop_prices.get(WEAPON_UP_V2, 150)
+        else:
+            name, price = "", 0
+        if (name and name not in carried_names and name not in already_wanted
+                and gold >= price):
+            items.append((name, 1))
     return items
 
 

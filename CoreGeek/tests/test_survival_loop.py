@@ -686,6 +686,93 @@ class SurvivalLoopTests(unittest.TestCase):
             (P.WALL_UP_V2, 2), economy.emergency_shopping_list(turn)[0],
         )
 
+    def test_destroyed_central_wall_does_not_drift_to_surviving_flank(self):
+        station = replace(self.station, pos=P.Pos(9, 22))
+        enemy = replace(self.station, unit_id=99999, pos=P.Pos(30, 9))
+        surviving_centre = replace(
+            self.wall, unit_id=40001, pos=P.Pos(12, 22), level=3, health=2000,
+        )
+        flank = replace(
+            self.wall, unit_id=40002, pos=P.Pos(12, 20), level=3, health=2000,
+        )
+        turn = replace(
+            self.base, round_no=391,
+            ours=(station, surviving_centre, flank), enemy_roles=(enemy,),
+        )
+        self.assertEqual(
+            (P.Pos(12, 21), P.Pos(12, 22)),
+            economy.central_front_positions(turn),
+        )
+        self.assertEqual((surviving_centre,), economy.central_front_walls(turn))
+        self.assertFalse(economy.central_front_intact(turn))
+
+    def test_missing_central_wall_preempts_closer_flank_build(self):
+        station = replace(self.station, pos=P.Pos(9, 22))
+        enemy = replace(self.station, unit_id=99999, pos=P.Pos(30, 9))
+        worker = replace(
+            self.worker, pos=P.Pos(10, 19), backpack=(P.STONE,),
+        )
+        turn = replace(
+            self.base, round_no=391,
+            ours=(station, worker), enemy_roles=(enemy,),
+        )
+        centre, _ = economy.central_front_positions(turn)
+        closer_flank = P.Pos(11, 19)
+        memory = Memory()
+        commands = {}
+        acted = economy._try_build(
+            turn, worker,
+            economy.Plan(wall_sites=(closer_flank, centre)),
+            set(), set(), memory, commands,
+        )
+        self.assertTrue(acted)
+        self.assertEqual(centre, memory.worker_targets[worker.unit_id])
+
+    def test_late_day_three_guarantees_three_two_one_then_attempts_three_three_one(self):
+        station = replace(self.station, pos=P.Pos(9, 22))
+        enemy = replace(self.station, unit_id=99999, pos=P.Pos(30, 9))
+        walls = (
+            replace(self.wall, unit_id=40000, pos=P.Pos(12, 21), level=3, health=2000),
+            replace(self.wall, unit_id=40001, pos=P.Pos(12, 22), level=3, health=2000),
+        )
+
+        def rockets(levels):
+            return tuple(
+                replace(
+                    self.rocket, unit_id=500 + index, pos=P.Pos(8, 20 + index),
+                    level=level, health=economy._wall_max_health(level),
+                )
+                for index, level in enumerate(levels)
+            )
+
+        turn = replace(
+            self.base, round_no=320, gold=124,
+            ours=(station, *rockets((3, 1, 1)), *walls), enemy_roles=(enemy,),
+        )
+        self.assertEqual(
+            (P.WEAPON_UP_V1, 1), economy.emergency_shopping_list(turn)[0],
+        )
+        turn = replace(turn, gold=150, ours=(station, *rockets((3, 2, 1)), *walls))
+        self.assertEqual(
+            (P.WEAPON_UP_V2, 1), economy.emergency_shopping_list(turn)[0],
+        )
+
+    def test_day_four_damaged_station_upgrade_does_not_wait_for_firepower(self):
+        station = replace(self.station, pos=P.Pos(9, 22), health=840)
+        rockets = tuple(
+            replace(
+                self.rocket, unit_id=500 + index, pos=P.Pos(8, 20 + index),
+                level=level,
+            )
+            for index, level in enumerate((3, 1, 1))
+        )
+        turn = replace(
+            self.base, round_no=391, gold=124, ours=(station, *rockets),
+        )
+        self.assertEqual(
+            (P.STATION_UP_V1, 1), economy.emergency_shopping_list(turn)[0],
+        )
+
     def test_three_two_one_battery_inserts_station_insurance_when_damaged(self):
         levels = (3, 2, 1)
         rockets = tuple(
